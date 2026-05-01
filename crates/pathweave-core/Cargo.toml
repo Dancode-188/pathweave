@@ -1,0 +1,23 @@
+[package]
+name = "pathweave-core"
+description = "Transport-agnostic p2p networking — core types, session layer, router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+snow = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }

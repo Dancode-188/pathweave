@@ -1,0 +1,17 @@
+[package]
+name = "pw-chat"
+description = "Pathweave terminal chat demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pathweave-core = { path = "../../crates/pathweave-core" }
+pathweave-transport-quic = { path = "../../crates/pathweave-transport-quic" }
+pathweave-transport-ble = { path = "../../crates/pathweave-transport-ble" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
