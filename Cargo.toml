@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "crates/pathweave-core",
+    "crates/pathweave-transport-quic",
+    "crates/pathweave-transport-ble",
+    "crates/pathweave-uniffi",
+    "examples/pw-chat",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dancode-188/pathweave"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# async
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time"] }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+
+# errors
+thiserror = "2"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# crypto
+snow = "0.10"
+blake3 = "1"
+bs58 = "0.5"
+
+# transports
+quinn = "0.11"
+rcgen = "0.13"
+btleplug = "0.11"
+
+# ffi
+uniffi = "0.28"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# bundle protocol
+bp7 = "7"
+
+# testing
+proptest = "1"

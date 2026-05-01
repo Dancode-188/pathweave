@@ -1,0 +1,18 @@
+# Rust build output
+/target
+
+# Backup files
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+*.pdb
+
+# Personal working space -- not for the repo
+scratch/
+
+# Environment files
+.env
