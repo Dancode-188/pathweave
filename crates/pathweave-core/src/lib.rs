@@ -54,7 +54,9 @@ pub struct NodeIdentity {
 
 impl NodeIdentity {
     pub fn generate() -> Self {
-        todo!("generate Noise_XX_25519_ChaChaPoly_BLAKE2s keypair via snow, derive PeerId via blake3")
+        todo!(
+            "generate Noise_XX_25519_ChaChaPoly_BLAKE2s keypair via snow, derive PeerId via blake3"
+        )
     }
 
     pub fn from_bytes(_private_key: &[u8]) -> Result<Self> {
