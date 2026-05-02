@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod session;
+pub use session::Session;
+
 pub type Result<T> = std::result::Result<T, PathweaveError>;
 
 // -- error ---------------------------------------------------------------
@@ -22,9 +25,9 @@ pub enum PathweaveError {
 
 // -- identity ------------------------------------------------------------
 
-const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+pub(crate) const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-fn peer_id_from_public_key(public_key: &[u8]) -> PeerId {
+pub(crate) fn peer_id_from_public_key(public_key: &[u8]) -> PeerId {
     PeerId(*blake3::hash(public_key).as_bytes())
 }
 
