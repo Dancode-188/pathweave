@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod bundle;
+pub use bundle::BundleLayer;
+
 pub mod session;
 pub use session::Session;
 
@@ -17,6 +20,8 @@ pub enum PathweaveError {
     Transport(String),
     #[error("session error: {0}")]
     Session(String),
+    #[error("bundle error: {0}")]
+    Bundle(String),
     #[error("invalid key material")]
     InvalidKey,
     #[error(transparent)]

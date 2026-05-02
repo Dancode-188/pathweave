@@ -48,7 +48,7 @@ uniffi = "0.28"
 clap = { version = "4", features = ["derive"] }
 
 # bundle protocol
-bp7 = "0.10"
+bp7 = { version = "0.10", default-features = false }
 
 # testing
 proptest = "1"
