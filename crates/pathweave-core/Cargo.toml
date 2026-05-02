@@ -18,6 +18,7 @@ snow = { workspace = true }
 blake3 = { workspace = true }
 bs58 = { workspace = true }
 x25519-dalek = { workspace = true }
+bp7 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

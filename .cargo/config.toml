@@ -1,0 +1,6 @@
+# nanorand 0.7.0 calls SystemFunction036 (RtlGenRandom) from advapi32.dll but does
+# not declare #[link(name = "advapi32")]. bp7 lists cdylib in its crate-type, so Cargo
+# builds a bp7 cdylib that requires all symbols resolved at link time. Adding advapi32
+# as a default library here supplies the missing symbol for that build step.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/DEFAULTLIB:advapi32.lib"]
