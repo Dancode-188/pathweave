@@ -48,7 +48,7 @@ implementing one trait. It doesn't touch anything else.
 |---|---|
 | `pathweave-core` | Transport trait, PathweaveNode, Router, Session layer, Bundle layer |
 | `pathweave-transport-quic` | QUIC implementation of Transport |
-| `pathweave-transport-ble` | BLE implementation of Transport |
+| `pathweave-transport-ble` | BLE implementation of Transport. btleplug for central mode (scanning, GATT); bluer for peripheral mode (advertising) on Linux; native platform APIs on mobile. |
 | `pathweave-uniffi` | FFI bindings layer. Exposes PathweaveNode to Swift and Kotlin. |
 | `pw-chat` (example) | Terminal chat demo. The v0.1.0 launch artifact. |
 
@@ -342,6 +342,44 @@ static public key revealed, full PeerId derived, communication begins.
 These UUIDs are permanent. They are part of the protocol. Changing them after any
 deployment breaks every integration silently.
 
+**Implementation split: central and peripheral mode**
+
+BLE has two roles: central (scanning, initiating GATT connections) and peripheral
+(advertising, accepting GATT connections). No single Rust crate covers both roles
+well across all platforms, so we split them.
+
+Central mode: `btleplug` v0.11, all platforms. Handles scanning and GATT connections.
+
+Peripheral mode: platform-specific.
+
+- Linux: `bluer`, a well-maintained async Rust crate that wraps the full BlueZ API
+  including advertising.
+- Android and iOS: the platform's native BLE APIs called through the UniFFI layer.
+  CoreBluetooth on iOS, BluetoothManager on Android. The `pathweave-transport-ble`
+  Rust crate is not used for peripheral mode on mobile; the native layer handles it.
+- macOS: deferred to v0.2.0. CoreBluetooth is available on macOS (same framework as
+  iOS); the native binding work is not prioritized for v0.1.0 given the primary
+  deployment targets are phones.
+- Windows: deferred to v0.2.0.
+
+**macOS and Windows peripheral mode**
+
+macOS has CoreBluetooth, the same framework used for iOS peripheral mode. The path
+exists. But the native binding work for macOS desktop is separate from the iOS UniFFI
+path, and the primary deployment targets for v0.1.0 are phones. macOS peripheral mode
+is deferred to v0.2.0.
+
+Windows has OS-level BLE GATT Server support (WinRT, since Windows 10 Creators
+Update) but no maintained Rust crate wraps it reliably. Implementing it requires
+writing a WinRT wrapper using the `windows` crate, which involves COM apartment
+threading rules that interact with async Rust runtimes in ways that produce subtle,
+hardware-dependent bugs. The risk and timeline cost are not justified for v0.1.0
+given that the primary deployment targets are phones.
+
+BLE peripheral development for v0.1.0 requires a Linux machine or a phone via the
+native bindings path. A macOS or Windows machine cannot act as the advertising peer
+in v0.1.0.
+
 ---
 
 ## Delivery guarantees (v0.1.0)
@@ -387,6 +425,10 @@ discovery is a v0.2.0 addition.
 When neither transport can reach the peer: "message failed: no transport available."
 No queuing, no silent retry. Known v0.1.0 limitation, documented as one.
 
+BLE in pw-chat works when at least one peer can advertise. Supported configurations
+for the BLE fallback demo: two Linux machines, or a Linux machine and a phone running
+the native SDK. macOS and Windows machines cannot act as the advertising peer in v0.1.0.
+
 ---
 
 ## What v0.1.0 doesn't do
@@ -399,6 +441,7 @@ Being clear about this matters as much as being clear about what it does.
 - No automatic QUIC peer discovery (mDNS)
 - No multi-hop BLE routing (single-hop only)
 - No contact or key registry (Noise_XK upgrade deferred to v0.2.0)
+- No BLE peripheral mode (advertising) on macOS or Windows (deferred to v0.2.0)
 - No security audit completed
 
 v1.0.0 means the API is stable and the library is ready for production use. We're
