@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 snow = "0.10"
 blake3 = "1"
 bs58 = "0.5"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # transports
 quinn = "0.11"
