@@ -119,7 +119,10 @@ impl Connection for BundleLayer {
             .map_err(|e| PathweaveError::Bundle(e.to_string()))?;
         let mut bundle = Bundle::new(
             pblock,
-            vec![new_payload_block(BlockControlFlags::empty(), bytes.to_vec())],
+            vec![new_payload_block(
+                BlockControlFlags::empty(),
+                bytes.to_vec(),
+            )],
         );
         bundle.set_crc(CRC_NO);
         bundle.sort_canonicals();
@@ -176,8 +179,7 @@ impl Connection for BundleLayer {
             let bundle = Bundle::try_from(raw.as_ref())
                 .map_err(|e| PathweaveError::Bundle(e.to_string()))?;
 
-            let flags =
-                BundleControlFlags::from_bits_truncate(bundle.primary.bundle_control_flags);
+            let flags = BundleControlFlags::from_bits_truncate(bundle.primary.bundle_control_flags);
 
             if !flags.contains(BundleControlFlags::BUNDLE_IS_FRAGMENT) {
                 let payload = bundle
@@ -234,8 +236,16 @@ mod tests {
         let (tx1, rx1) = unbounded_channel();
         let (tx2, rx2) = unbounded_channel();
         (
-            TestConn { tx: tx1, rx: rx2, mtu },
-            TestConn { tx: tx2, rx: rx1, mtu },
+            TestConn {
+                tx: tx1,
+                rx: rx2,
+                mtu,
+            },
+            TestConn {
+                tx: tx2,
+                rx: rx1,
+                mtu,
+            },
         )
     }
 
