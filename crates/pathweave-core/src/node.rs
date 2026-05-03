@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use futures::stream::BoxStream;
 
 use crate::{
-    MessageHandler, NodeConfig, NodeIdentity, PathweaveError, PeerAnnouncement, PeerId, Result,
-    Router, Transport, TransportEvent,
+    BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError,
+    PeerAnnouncement, PeerId, Result, Router, Session, Transport, TransportEvent,
 };
 
 /// The top-level entry point for the Pathweave library.
@@ -23,7 +23,7 @@ pub struct PathweaveNode {
     router: Router,
     identity: NodeIdentity,
     peers: HashMap<PeerId, PeerAnnouncement>,
-    handler: Mutex<Option<Box<dyn MessageHandler>>>,
+    handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
 }
 
 impl PathweaveNode {
@@ -34,16 +34,21 @@ impl PathweaveNode {
             router: Router::new(),
             identity,
             peers: HashMap::new(),
-            handler: Mutex::new(None),
+            handler: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Registers a transport and starts its background availability monitor.
+    /// Registers a transport, starts its background availability monitor, and
+    /// spawns an accept loop that delivers incoming connections to the message handler.
     ///
     /// Not part of the UniFFI boundary; Rust callers use this during setup.
     /// Must be called before any send() calls that depend on this transport.
     pub fn register_transport(&mut self, transport: Box<dyn Transport>) {
-        self.router.register_transport(transport);
+        let arc: Arc<dyn Transport> = Arc::from(transport);
+        let identity = self.identity.clone();
+        let handler = Arc::clone(&self.handler);
+        tokio::spawn(accept_loop(Arc::clone(&arc), identity, handler));
+        self.router.register_transport(arc);
     }
 
     /// Records a known PeerId -> PeerAnnouncement mapping in the peer table.
@@ -74,9 +79,9 @@ impl PathweaveNode {
 
     /// Registers a handler that will be called for each incoming message.
     ///
-    /// The accept loop that delivers messages to this handler is scaffolded
-    /// here but not yet wired: transport crates are stubs in v0.1.0. The
-    /// handler is stored and will be used once accept loops are implemented.
+    /// The accept loop is spawned per transport in register_transport(). Transports
+    /// that do not support incoming connections (e.g. BLE central mode) return an
+    /// error from accept(), which the loop handles with a backoff.
     pub fn on_message(&self, handler: Box<dyn MessageHandler>) {
         *self.handler.lock().unwrap() = Some(handler);
     }
@@ -84,6 +89,58 @@ impl PathweaveNode {
     /// Returns a stream of transport lifecycle events from the Router.
     pub fn events(&self) -> BoxStream<'_, TransportEvent> {
         self.router.events()
+    }
+}
+
+/// Loops calling transport.accept(). Each accepted connection is handed to
+/// handle_incoming in a spawned task. On error, backs off for 5 seconds to
+/// avoid busy-looping for transports that don't support incoming connections.
+async fn accept_loop(
+    transport: Arc<dyn Transport>,
+    identity: NodeIdentity,
+    handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+) {
+    loop {
+        match transport.accept().await {
+            Ok(conn) => {
+                let identity = identity.clone();
+                let handler = Arc::clone(&handler);
+                tokio::spawn(handle_incoming(conn, identity, handler));
+            }
+            Err(e) => {
+                tracing::debug!(transport = transport.name(), "accept error: {}", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// Completes the Noise_XX handshake as the responder, then loops receiving
+/// messages and delivering them to the handler until the connection closes.
+async fn handle_incoming(
+    conn: Box<dyn Connection>,
+    identity: NodeIdentity,
+    handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+) {
+    let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(conn));
+    let mut session = match Session::respond(&identity, bundled).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("incoming handshake failed: {}", e);
+            return;
+        }
+    };
+    let peer_id = session.peer_id().clone();
+    loop {
+        match session.recv().await {
+            Ok(payload) => {
+                let guard = handler.lock().unwrap();
+                if let Some(h) = guard.as_ref() {
+                    h.on_message(peer_id.clone(), payload.to_vec());
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -140,7 +197,7 @@ mod tests {
         }
     }
 
-    // --- mock transport -------------------------------------------------------
+    // --- mock transport for outbound-only tests --------------------------------
 
     struct MockTransport {
         cost: TransportCost,
@@ -171,7 +228,9 @@ mod tests {
         }
 
         async fn accept(&self) -> Result<Box<dyn Connection>> {
-            Err(PathweaveError::Transport("not used in tests".into()))
+            // No inbound side; back off so the accept loop doesn't spin.
+            futures::future::pending::<()>().await;
+            unreachable!()
         }
 
         fn mtu_hint(&self) -> usize {
@@ -208,6 +267,58 @@ mod tests {
             count,
         )
     }
+
+    // --- mock transport for accept-side tests ---------------------------------
+
+    struct AcceptMockTransport {
+        conn_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Box<dyn Connection>>>,
+    }
+
+    #[async_trait]
+    impl crate::Transport for AcceptMockTransport {
+        async fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
+            Box::pin(stream::empty())
+        }
+
+        async fn connect(&self, _peer: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
+            Err(PathweaveError::Transport("not used".into()))
+        }
+
+        async fn accept(&self) -> Result<Box<dyn Connection>> {
+            self.conn_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| PathweaveError::Transport("no more connections".into()))
+        }
+
+        fn mtu_hint(&self) -> usize {
+            65535
+        }
+
+        fn cost(&self) -> TransportCost {
+            TransportCost::Free
+        }
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::Ble
+        }
+
+        fn name(&self) -> &'static str {
+            "accept-mock"
+        }
+    }
+
+    // -------------------------------------------------------------------------
 
     fn dummy_peer() -> PeerAnnouncement {
         PeerAnnouncement {
@@ -297,5 +408,61 @@ mod tests {
             .unwrap();
         // events() must not panic and must return a stream.
         let _stream = node.events();
+    }
+
+    #[tokio::test]
+    async fn incoming_message_delivered_to_handler() {
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
+        let transport = AcceptMockTransport {
+            conn_rx: tokio::sync::Mutex::new(conn_rx),
+        };
+
+        let receiver_id = NodeIdentity::generate();
+        let sender_id = NodeIdentity::generate();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        struct RecordingHandler {
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+        }
+        impl MessageHandler for RecordingHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(transport));
+        node.on_message(Box::new(RecordingHandler {
+            done_tx: Arc::clone(&done_tx),
+        }));
+
+        // Yield so the accept loop starts and blocks on accept().
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Inject an inbound connection and run the initiator concurrently.
+        let (client_conn, server_conn) = conn_pair();
+        conn_tx
+            .send(Box::new(server_conn))
+            .expect("transport still alive");
+
+        tokio::spawn(async move {
+            let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(client_conn)));
+            let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
+            session.send(b"hello from peer").await.unwrap();
+        });
+
+        let payload = tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out waiting for message")
+            .unwrap();
+
+        assert_eq!(payload, b"hello from peer");
     }
 }
