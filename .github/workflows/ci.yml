@@ -50,6 +50,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        # Fails on CVE-tracked vulnerabilities. Unmaintained/unsound crates
+        # appear as warnings in the log but do not fail the build. This is
+        # intentional: bp7's transitive deps include nanorand (unmaintained)
+        # which is not in our crypto path and carries no CVE advisory.
+        run: cargo audit
