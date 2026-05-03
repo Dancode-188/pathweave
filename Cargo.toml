@@ -40,6 +40,7 @@ quinn = "0.11"
 rcgen = "0.13"
 btleplug = "0.11"
 bluer = { version = "0.17", features = ["full"] }
+uuid = "1"
 
 # ffi
 uniffi = "0.28"
