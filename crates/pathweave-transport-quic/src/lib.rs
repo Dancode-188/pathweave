@@ -8,13 +8,13 @@ use pathweave_core::{
     TransportKind,
 };
 use quinn::{
-    ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig,
     crypto::rustls::QuicClientConfig,
     rustls::{
         self,
         client::danger::ServerCertVerifier,
         pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
     },
+    ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig,
 };
 use rcgen::CertifiedKey;
 use tokio::sync::Mutex;
@@ -61,8 +61,8 @@ fn make_client_config() -> Result<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
-    let quic_client_config = QuicClientConfig::try_from(crypto)
-        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+    let quic_client_config =
+        QuicClientConfig::try_from(crypto).map_err(|e| PathweaveError::Transport(e.to_string()))?;
     Ok(ClientConfig::new(Arc::new(quic_client_config)))
 }
 
