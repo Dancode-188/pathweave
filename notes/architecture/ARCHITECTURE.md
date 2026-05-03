@@ -59,7 +59,10 @@ the previous.
 
 ## The public API
 
-Four surfaces. Nothing else is public.
+The public API has six surfaces: four exposed through UniFFI to Swift and Kotlin,
+two Rust-only setup methods that are not part of the FFI boundary.
+
+**UniFFI-facing (four):**
 
 ```rust
 // 1. create a node
@@ -74,6 +77,22 @@ node.on_message(handler); // handler implements MessageHandler (see below)
 // 4. subscribe to transport events
 let mut events = node.events(); // Stream<Item = TransportEvent>
 ```
+
+**Rust-only setup (two, not in the UDL):**
+
+```rust
+// register a transport before first use
+node.register_transport(Box::new(quic));
+
+// inject a known peer address (e.g. QUIC --peer <address> from the command line)
+// the PeerId -> PeerAnnouncement mapping is populated here so send() can route to it
+node.add_peer(peer_id, announcement);
+```
+
+`connect(announcement: PeerAnnouncement) -> Result<PeerId>` is the intended v0.2.0
+method for dialing a peer, completing the Noise_XX handshake, learning their PeerId,
+and storing it in the peer table. It requires working transport implementations and is
+deferred until QUIC and BLE transports are complete.
 
 **MessageHandler** is a callback interface, not a closure. This is a UniFFI requirement --
 closures don't cross FFI boundaries cleanly. In Rust, you implement the trait. In Swift,

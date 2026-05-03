@@ -5,6 +5,9 @@ use futures::stream::BoxStream;
 pub mod bundle;
 pub use bundle::BundleLayer;
 
+pub mod node;
+pub use node::PathweaveNode;
+
 pub mod router;
 pub use router::Router;
 
@@ -235,24 +238,4 @@ pub trait Connection: Send + Sync {
 #[derive(Default)]
 pub struct NodeConfig {
     pub listen_port: Option<u16>,
-}
-
-pub struct PathweaveNode;
-
-impl PathweaveNode {
-    pub async fn new(_config: NodeConfig, _identity: NodeIdentity) -> Result<Self> {
-        todo!("initialize router, session layer, and transport registry")
-    }
-
-    pub async fn send(&self, _peer_id: PeerId, _payload: Vec<u8>) -> Result<()> {
-        todo!("route payload through best available transport via session layer")
-    }
-
-    pub fn on_message(&self, _handler: Box<dyn MessageHandler>) {
-        todo!("register message handler for incoming bundles")
-    }
-
-    pub fn events(&self) -> BoxStream<'_, TransportEvent> {
-        todo!("subscribe to transport events from the router")
-    }
 }
