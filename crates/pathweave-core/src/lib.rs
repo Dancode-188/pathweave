@@ -5,6 +5,9 @@ use futures::stream::BoxStream;
 pub mod bundle;
 pub use bundle::BundleLayer;
 
+pub mod router;
+pub use router::Router;
+
 pub mod session;
 pub use session::Session;
 
@@ -59,6 +62,7 @@ impl std::fmt::Display for PeerId {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeIdentity {
     pub(crate) private_key: Vec<u8>,
     pub(crate) public_key: Vec<u8>,
@@ -214,6 +218,7 @@ pub trait Transport: Send + Sync {
     async fn accept(&self) -> Result<Box<dyn Connection>>;
     fn mtu_hint(&self) -> usize;
     fn cost(&self) -> TransportCost;
+    fn kind(&self) -> TransportKind;
     fn name(&self) -> &'static str;
 }
 

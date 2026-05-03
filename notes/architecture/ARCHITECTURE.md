@@ -160,6 +160,7 @@ pub trait Transport: Send + Sync {
     async fn accept(&self) -> Result<Box<dyn Connection>>;
     fn mtu_hint(&self) -> usize;
     fn cost(&self) -> TransportCost;
+    fn kind(&self) -> TransportKind;
     fn name(&self) -> &'static str;
 }
 
