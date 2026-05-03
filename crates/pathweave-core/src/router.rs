@@ -36,8 +36,7 @@ impl Router {
     }
 
     /// Registers a transport and starts its availability monitoring task.
-    pub fn register_transport(&mut self, transport: Box<dyn Transport>) {
-        let transport: Arc<dyn Transport> = Arc::from(transport);
+    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) {
         let available = Arc::new(AtomicBool::new(false));
 
         let t = Arc::clone(&transport);
@@ -250,17 +249,21 @@ mod tests {
         cost: TransportCost,
         kind: TransportKind,
         fail_connect: bool,
-    ) -> (MockTransport, UnboundedReceiver<TestConn>, Arc<AtomicUsize>) {
+    ) -> (
+        Arc<MockTransport>,
+        UnboundedReceiver<TestConn>,
+        Arc<AtomicUsize>,
+    ) {
         let (tx, rx) = unbounded_channel();
         let count = Arc::new(AtomicUsize::new(0));
         (
-            MockTransport {
+            Arc::new(MockTransport {
                 cost,
                 kind,
                 fail_connect,
                 responder_tx: tx,
                 connect_count: Arc::clone(&count),
-            },
+            }),
             rx,
             count,
         )
@@ -289,8 +292,8 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
         let mut router = Router::new();
-        router.register_transport(Box::new(ble));
-        router.register_transport(Box::new(quic));
+        router.register_transport(ble);
+        router.register_transport(quic);
 
         // Yield so monitoring tasks run start() and set available = true.
         tokio::task::yield_now().await;
@@ -325,8 +328,8 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
         let mut router = Router::new();
-        router.register_transport(Box::new(ble));
-        router.register_transport(Box::new(quic));
+        router.register_transport(ble);
+        router.register_transport(quic);
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -362,8 +365,8 @@ mod tests {
         let (quic, _quic_rx, _) = make_transport(TransportCost::Metered, TransportKind::Quic, true);
 
         let mut router = Router::new();
-        router.register_transport(Box::new(ble));
-        router.register_transport(Box::new(quic));
+        router.register_transport(ble);
+        router.register_transport(quic);
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;

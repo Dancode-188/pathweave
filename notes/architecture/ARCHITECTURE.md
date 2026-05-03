@@ -262,6 +262,45 @@ experiences this delay during a failover. This is acceptable behavior.
 
 ---
 
+## Incoming message delivery (the accept loop)
+
+`register_transport()` on `PathweaveNode` does two things: hands the transport to the
+Router for outbound use, and spawns an accept loop task that runs for the lifetime of
+the node.
+
+The accept loop:
+
+```
+loop {
+    conn = transport.accept().await
+    if error: log, sleep 5 s, retry    // handles transports that don't support inbound
+    spawn handle_incoming(conn)
+}
+```
+
+`handle_incoming` runs per-connection:
+
+```
+BundleLayer::new(conn)               // wraps in bundle framing
+Session::respond(identity, bundled)  // Noise_XX handshake as responder
+peer_id = session.peer_id()          // identity revealed after handshake
+loop:
+    payload = session.recv()
+    handler.on_message(peer_id, payload)  // delivered to the registered handler
+```
+
+The handler is stored as `Arc<Mutex<Option<Box<dyn MessageHandler>>>>`. The Arc is
+cloned into each accept loop task so a single handler registration covers all
+transports. Locking is brief: the `on_message` call is synchronous and the lock is
+released before the next recv().await.
+
+Transports that don't support inbound connections (BLE central mode in v0.1.0) return
+an error from `accept()`. The accept loop catches this, logs it at debug level, and
+backs off for 5 seconds before retrying. This means registering a central-only BLE
+transport does not produce a tight busy loop.
+
+---
+
 ## The session layer
 
 Handles the Noise handshake and all encryption and decryption. Lives entirely in
