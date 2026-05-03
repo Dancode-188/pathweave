@@ -327,6 +327,16 @@ anyone integrating Pathweave to understand.
 
 Crates: `quinn` v0.11, `rcgen` for certificate generation.
 
+## QUIC stream framing
+
+QUIC is a byte stream, not a message stream. The Bundle layer sends complete BPv7
+bundles and expects to receive complete bundles. To reassemble messages correctly,
+`QuicConnection` prefixes every write with a 4-byte big-endian length, then reads the
+same 4-byte prefix on the receiving end before reading exactly that many payload bytes.
+
+Any future transport that wraps a byte-stream protocol (TCP, WebSocket in binary mode,
+etc.) should use the same framing convention for consistency.
+
 ---
 
 ## BLE peer discovery
