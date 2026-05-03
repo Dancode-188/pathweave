@@ -131,15 +131,10 @@ async fn handle_incoming(
         }
     };
     let peer_id = session.peer_id().clone();
-    loop {
-        match session.recv().await {
-            Ok(payload) => {
-                let guard = handler.lock().unwrap();
-                if let Some(h) = guard.as_ref() {
-                    h.on_message(peer_id.clone(), payload.to_vec());
-                }
-            }
-            Err(_) => break,
+    while let Ok(payload) = session.recv().await {
+        let guard = handler.lock().unwrap();
+        if let Some(h) = guard.as_ref() {
+            h.on_message(peer_id.clone(), payload.to_vec());
         }
     }
 }
