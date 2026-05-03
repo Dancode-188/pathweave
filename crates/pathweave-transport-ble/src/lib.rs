@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use pathweave_core::{Connection, PeerAnnouncement, Result, Transport, TransportCost};
+use pathweave_core::{
+    Connection, PeerAnnouncement, Result, Transport, TransportCost, TransportKind,
+};
 
 pub struct BleTransport;
 
@@ -32,6 +34,10 @@ impl Transport for BleTransport {
 
     fn cost(&self) -> TransportCost {
         TransportCost::Free
+    }
+
+    fn kind(&self) -> TransportKind {
+        TransportKind::Ble
     }
 
     fn name(&self) -> &'static str {
