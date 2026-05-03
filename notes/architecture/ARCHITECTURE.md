@@ -89,10 +89,10 @@ node.register_transport(Box::new(quic));
 node.add_peer(peer_id, announcement);
 ```
 
-`connect(announcement: PeerAnnouncement) -> Result<PeerId>` is the intended v0.2.0
-method for dialing a peer, completing the Noise_XX handshake, learning their PeerId,
-and storing it in the peer table. It requires working transport implementations and is
-deferred until QUIC and BLE transports are complete.
+`connect(announcement: PeerAnnouncement) -> Result<PeerId>` dials the peer, completes
+the Noise_XX handshake as the initiator, stores `(PeerId, PeerAnnouncement)` in the
+peer table, and returns the PeerId. The session is closed immediately after the handshake;
+`send()` re-dials on each call (lazy connections). Tries transports in cost order.
 
 **MessageHandler** is a callback interface, not a closure. This is a UniFFI requirement --
 closures don't cross FFI boundaries cleanly. In Rust, you implement the trait. In Swift,

@@ -51,6 +51,19 @@ impl PathweaveNode {
         self.router.register_transport(arc);
     }
 
+    /// Dials `announcement`, completes the Noise_XX handshake as the initiator, stores
+    /// the resulting PeerId -> announcement mapping in the peer table, and returns the PeerId.
+    ///
+    /// Tries transports in cost order (Free first). The handshake session is closed
+    /// immediately after the PeerId is learned; subsequent send() calls re-dial.
+    ///
+    /// Returns NoTransportAvailable if no registered transport is available or all fail.
+    pub async fn connect(&mut self, announcement: PeerAnnouncement) -> Result<PeerId> {
+        let peer_id = self.router.connect(&announcement, &self.identity).await?;
+        self.peers.insert(peer_id.clone(), announcement);
+        Ok(peer_id)
+    }
+
     /// Records a known PeerId -> PeerAnnouncement mapping in the peer table.
     ///
     /// Not part of the UniFFI boundary. Used by pw-chat to inject a QUIC peer
@@ -459,5 +472,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(payload, b"hello from peer");
+    }
+
+    #[tokio::test]
+    async fn connect_learns_and_stores_peer_id() {
+        let (mock, mut mock_rx, _) = make_transport(TransportCost::Free, TransportKind::Ble);
+
+        let initiator_id = NodeIdentity::generate();
+        let responder_id = NodeIdentity::generate();
+        let expected_peer_id = responder_id.peer_id().clone();
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), initiator_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(mock));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        tokio::spawn(async move {
+            let conn = mock_rx.recv().await.unwrap();
+            run_responder(conn, responder_id).await;
+        });
+
+        let peer_id = node.connect(dummy_peer()).await.unwrap();
+        assert_eq!(peer_id, expected_peer_id);
+        // Verify the mapping was stored so send() can now route to this peer.
+        assert!(node.peers.contains_key(&peer_id));
+    }
+
+    #[tokio::test]
+    async fn connect_no_transport_returns_error() {
+        let mut node = PathweaveNode::new(NodeConfig::default(), NodeIdentity::generate())
+            .await
+            .unwrap();
+        let result = node
+            .connect(PeerAnnouncement {
+                address: PeerAddress::Quic("127.0.0.1:1234".parse().unwrap()),
+                short_id: None,
+            })
+            .await;
+        assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
 }

@@ -6,8 +6,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::{
-    BundleLayer, NodeIdentity, PathweaveError, PeerAnnouncement, Result, Session, Transport,
-    TransportCost, TransportEvent,
+    BundleLayer, NodeIdentity, PathweaveError, PeerAnnouncement, PeerId, Result, Session,
+    Transport, TransportCost, TransportEvent,
 };
 
 struct TransportEntry {
@@ -85,6 +85,35 @@ impl Router {
         Err(PathweaveError::NoTransportAvailable)
     }
 
+    /// Dials `peer`, completes the Noise_XX handshake as the initiator, and returns
+    /// the remote PeerId. Tries transports in cost order (Free first). The session is
+    /// closed after the handshake; the caller is responsible for storing the mapping.
+    pub async fn connect(
+        &self,
+        peer: &PeerAnnouncement,
+        identity: &NodeIdentity,
+    ) -> Result<PeerId> {
+        let mut candidates: Vec<&TransportEntry> = self
+            .transports
+            .iter()
+            .filter(|t| t.available.load(Ordering::Acquire))
+            .collect();
+
+        candidates.sort_by_key(|t| match t.transport.cost() {
+            TransportCost::Free => 0u8,
+            TransportCost::Metered => 1,
+            TransportCost::Unknown => 2,
+        });
+
+        for entry in candidates {
+            if let Ok(peer_id) = try_connect(entry.transport.as_ref(), peer, identity).await {
+                return Ok(peer_id);
+            }
+        }
+
+        Err(PathweaveError::NoTransportAvailable)
+    }
+
     /// Returns a stream of transport lifecycle events.
     pub fn events(&self) -> BoxStream<'_, TransportEvent> {
         let rx = self.event_tx.subscribe();
@@ -123,6 +152,19 @@ async fn monitor(transport: Arc<dyn Transport>, available: Arc<AtomicBool>) {
         // replace this with QUIC keepalive loops or BLE scan loops.
         std::future::pending::<()>().await;
     }
+}
+
+/// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
+/// The session is dropped after the handshake, closing the connection.
+async fn try_connect(
+    transport: &dyn Transport,
+    peer: &PeerAnnouncement,
+    identity: &NodeIdentity,
+) -> Result<PeerId> {
+    let raw = transport.connect(peer).await?;
+    let bundled = Box::new(BundleLayer::new(raw));
+    let session = Session::initiate(identity, bundled).await?;
+    Ok(session.peer_id().clone())
 }
 
 /// Opens a connection through the given transport, wraps it in BundleLayer and
@@ -389,6 +431,37 @@ mod tests {
         let result = router
             .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
             .await;
+        assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
+    }
+
+    #[tokio::test]
+    async fn connect_returns_peer_id_on_success() {
+        let (transport, mut rx, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
+
+        let mut router = Router::new();
+        router.register_transport(transport);
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let initiator_id = NodeIdentity::generate();
+        let responder_id = NodeIdentity::generate();
+        let expected_peer_id = responder_id.peer_id().clone();
+
+        tokio::spawn(async move {
+            let conn = rx.recv().await.unwrap();
+            run_responder(conn, responder_id).await;
+        });
+
+        let peer_id = router.connect(&dummy_peer(), &initiator_id).await.unwrap();
+        assert_eq!(peer_id, expected_peer_id);
+    }
+
+    #[tokio::test]
+    async fn connect_returns_no_transport_when_none_registered() {
+        let router = Router::new();
+        let identity = NodeIdentity::generate();
+        let result = router.connect(&dummy_peer(), &identity).await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
 }
