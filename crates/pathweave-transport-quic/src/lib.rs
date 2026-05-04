@@ -230,6 +230,15 @@ pub struct QuicConnection {
     recv: RecvStream,
 }
 
+// Quinn resets a SendStream on drop instead of sending FIN, so the receiver
+// gets a stream-reset error before it can read buffered data. Finish here to
+// ensure every code path sends FIN and the peer can drain the stream cleanly.
+impl Drop for QuicConnection {
+    fn drop(&mut self) {
+        let _ = self.send.finish();
+    }
+}
+
 // QUIC is a byte stream, not a message stream. We prefix every frame with a
 // 4-byte big-endian length so recv_bytes can reassemble complete messages.
 #[async_trait]
