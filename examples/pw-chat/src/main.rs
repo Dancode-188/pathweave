@@ -12,13 +12,21 @@ use tokio::io::AsyncBufReadExt;
 const DEFAULT_LISTEN_PORT: u16 = 9001;
 
 #[derive(Parser)]
-#[command(name = "pw-chat", about = "Pathweave terminal chat demo")]
+#[command(
+    name = "pw-chat",
+    about = "Pathweave terminal chat demo",
+    long_about = "Bidirectional encrypted chat over QUIC with automatic BLE fallback.\n\n\
+        Run with --peer on both sides for full bidirectional chat:\n\
+        \n  Machine A:  pw-chat --peer 192.168.1.2:9001\
+        \n  Machine B:  pw-chat --peer 192.168.1.1:9001\n\n\
+        Omit --peer to listen and receive only."
+)]
 struct Args {
-    /// QUIC peer address (host:port). Omit to run in listener mode.
+    /// QUIC peer address (host:port). Specify on both sides for bidirectional chat.
     #[arg(long)]
     peer: Option<SocketAddr>,
 
-    /// Local QUIC listen port (listener mode only).
+    /// Local QUIC listen port. Must match what the other side connects to.
     #[arg(long, default_value_t = DEFAULT_LISTEN_PORT)]
     port: u16,
 }
@@ -55,8 +63,9 @@ async fn main() {
         .expect("failed to create node");
 
     if let Some(peer_addr) = args.peer {
-        // Initiator mode: bind to an OS-assigned port, dial the peer.
-        let quic = QuicTransport::new("0.0.0.0:0".parse().unwrap());
+        // Bidirectional mode: bind to a known port so the peer can connect back.
+        let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse().unwrap();
+        let quic = QuicTransport::new(listen_addr);
         node.register_transport(Box::new(quic));
         node.register_transport(Box::new(BleTransport::new()));
 
