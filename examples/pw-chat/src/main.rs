@@ -69,9 +69,9 @@ async fn main() {
         node.register_transport(Box::new(quic));
         node.register_transport(Box::new(BleTransport::new()));
 
-        // Yield so the monitor tasks run start() and mark transports available.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        // Give monitor tasks time to call start() and bind real sockets.
+        // yield_now() is sufficient for in-memory mocks but not for OS socket binding.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let announcement = PeerAnnouncement {
             address: PeerAddress::Quic(peer_addr),
@@ -79,7 +79,14 @@ async fn main() {
         };
 
         print!("connecting to {}...", peer_addr);
-        let peer_id = node.connect(announcement).await.expect("failed to connect");
+        let peer_id = match node.connect(announcement).await {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("error: could not connect to {}: {}", peer_addr, e);
+                eprintln!("hint: check that the other side is running and port {} is not blocked by a firewall", args.port);
+                std::process::exit(1);
+            }
+        };
         let short_id = &peer_id.to_base58()[..8];
         println!(" connected. peer: {}", short_id);
 
