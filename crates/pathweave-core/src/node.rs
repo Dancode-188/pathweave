@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream::BoxStream;
 
+use tokio::sync::Notify;
+
 use crate::{
     BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError,
     PeerAnnouncement, PeerId, Result, Router, Session, Transport, TransportEvent,
@@ -47,8 +49,8 @@ impl PathweaveNode {
         let arc: Arc<dyn Transport> = Arc::from(transport);
         let identity = self.identity.clone();
         let handler = Arc::clone(&self.handler);
-        tokio::spawn(accept_loop(Arc::clone(&arc), identity, handler));
-        self.router.register_transport(arc);
+        let started = self.router.register_transport(Arc::clone(&arc));
+        tokio::spawn(accept_loop(arc, identity, handler, started));
     }
 
     /// Dials `announcement`, completes the Noise_XX handshake as the initiator, stores
@@ -105,14 +107,17 @@ impl PathweaveNode {
     }
 }
 
-/// Loops calling transport.accept(). Each accepted connection is handed to
-/// handle_incoming in a spawned task. On error, backs off for 5 seconds to
-/// avoid busy-looping for transports that don't support incoming connections.
+/// Loops calling transport.accept(). Waits for the transport's start() to complete
+/// before the first accept() call, eliminating the startup race. Each accepted
+/// connection is handed to handle_incoming in a spawned task. On error, backs off
+/// for 5 seconds to avoid busy-looping for transports that don't support inbound.
 async fn accept_loop(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+    started: Arc<Notify>,
 ) {
+    started.notified().await;
     loop {
         match transport.accept().await {
             Ok(conn) => {
