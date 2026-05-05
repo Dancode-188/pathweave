@@ -287,7 +287,10 @@ peer_id = session.peer_id()          // identity revealed after handshake
 loop:
     payload = session.recv()
     handler.on_message(peer_id, payload)  // delivered to the registered handler
+    session.send(b"")                // empty ACK to the sender (see note below)
 ```
+
+**Why the ACK is required:** Quinn's `write_all()` writes to an internal send buffer; actual transmission is async. If the sender drops the session immediately after `send()`, Quinn fires `CONNECTION_CLOSE` before flushing the buffer and the data is silently lost. The receiver's empty ACK keeps the sender's connection alive long enough for the data to be transmitted. `send()` returning `Ok(())` is only meaningful when this round-trip completes. See ADR 009 and issue #34.
 
 The handler is stored as `Arc<Mutex<Option<Box<dyn MessageHandler>>>>`. The Arc is
 cloned into each accept loop task so a single handler registration covers all
@@ -453,10 +456,13 @@ in v0.1.0.
 
 ## Delivery guarantees (v0.1.0)
 
-Best-effort. `send()` returns `Ok(())` when bytes are handed to the transport. No
-guarantee of delivery, ordering, or exactly-once semantics. BPv7 bundle IDs are there
-to support at-least-once delivery later, but v0.1.0 doesn't implement it.
+Single-attempt confirmed delivery. `send()` returns `Ok(())` when the receiver has
+acknowledged delivery via the session ACK round-trip. No guarantee of ordering or
+exactly-once semantics. If the connection fails before the ACK arrives, `send()` returns
+an error -- there is no automatic retry. BPv7 bundle IDs are there to support full
+at-least-once delivery with retry later, but v0.1.0 doesn't implement it.
 
+This is stronger than "bytes handed to the transport" but weaker than at-least-once.
 The README and docs say this plainly. A developer who knows the constraint can design
 around it.
 
