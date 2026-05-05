@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::stream::{self, BoxStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -36,18 +36,26 @@ impl Router {
     }
 
     /// Registers a transport and starts its availability monitoring task.
-    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) {
+    ///
+    /// Returns a `Notify` that fires once after `start()` succeeds. Callers that
+    /// need to wait until the transport is ready (e.g. the accept loop) should
+    /// await `notified()` on the returned handle before proceeding.
+    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) -> Arc<Notify> {
         let available = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
 
         let t = Arc::clone(&transport);
         let a = Arc::clone(&available);
-        let task = tokio::spawn(monitor(t, a));
+        let s = Arc::clone(&started);
+        let task = tokio::spawn(monitor(t, a, s));
 
         self.transports.push(TransportEntry {
             transport,
             available,
             task,
         });
+
+        started
     }
 
     /// Sends `payload` to `peer` through the lowest-cost available transport.
@@ -143,13 +151,12 @@ impl Drop for Router {
     }
 }
 
-/// Monitors a single transport. Marks it available after start() succeeds and
-/// keeps it marked available until the router is dropped (which aborts this task).
-async fn monitor(transport: Arc<dyn Transport>, available: Arc<AtomicBool>) {
+/// Monitors a single transport. Marks it available after start() succeeds, signals
+/// `started` so the accept loop can begin, then parks until the router is dropped.
+async fn monitor(transport: Arc<dyn Transport>, available: Arc<AtomicBool>, started: Arc<Notify>) {
     if transport.start().await.is_ok() {
         available.store(true, Ordering::Release);
-        // Runs until aborted by Router::drop. Real transport implementations
-        // replace this with QUIC keepalive loops or BLE scan loops.
+        started.notify_one();
         std::future::pending::<()>().await;
     }
 }
