@@ -144,21 +144,16 @@ async fn handle_incoming(
         }
     };
     let peer_id = session.peer_id().clone();
-    loop {
-        match session.recv().await {
-            Ok(payload) => {
-                {
-                    let guard = handler.lock().unwrap();
-                    if let Some(h) = guard.as_ref() {
-                        h.on_message(peer_id.clone(), payload.to_vec());
-                    }
-                }
-                // ACK so the sender knows the data was delivered before it tears
-                // down the QUIC connection (see try_send in router.rs).
-                let _ = session.send(b"").await;
+    while let Ok(payload) = session.recv().await {
+        {
+            let guard = handler.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.on_message(peer_id.clone(), payload.to_vec());
             }
-            Err(_) => break,
         }
+        // ACK so the sender knows the data was delivered before it tears
+        // down the QUIC connection (see try_send in router.rs).
+        let _ = session.send(b"").await;
     }
 }
 
