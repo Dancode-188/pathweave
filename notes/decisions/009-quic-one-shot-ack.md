@@ -68,6 +68,21 @@ WebSocket) has the same risk: writing bytes to a socket does not mean they were
 received. New transports should document their flushing behavior and confirm that the
 session ACK round-trip is sufficient to guarantee delivery for their protocol.
 
-BLE is not affected by this. GATT notifications are message-oriented; the underlying
-BLE stack delivers complete frames, and the ACK round-trip still runs over the Noise
-session for consistency.
+BLE is not affected by the QUIC buffering issue, but the ACK is not optional on BLE
+either. GATT write-without-response has no link-layer delivery guarantee — the
+characteristic write is fire-and-forget at the BLE protocol level. The Noise session
+ACK is the only confirmation that the payload reached the handler. The ACK is arguably
+more load-bearing on BLE than on QUIC, where at least Quinn confirms the bytes reached
+the peer's buffer.
+
+**Double-delivery edge case:** if `handler.on_message()` succeeds but the ACK is lost
+(connection drops between delivery and ACK), `try_send()` times out after 5 seconds.
+The payload was delivered but the sender cannot know this. A retry at the application
+layer would send the message again. This is acceptable in v0.1.0 and is the exact
+problem that v0.2.0's at-least-once delivery work (BPv7 bundle IDs + retry) is designed
+to solve. Do not treat a 5-second timeout as equivalent to "delivery failed."
+
+**Per-message latency:** each message currently costs a full QUIC handshake, a Noise_XX
+handshake, the payload send, and the ACK round-trip. On a local network this is
+acceptable for a chat demo. At scale or under latency constraints it becomes a problem,
+which is the primary motivation for persistent connections in v0.2.0.
