@@ -168,7 +168,7 @@ async fn try_connect(
 }
 
 /// Opens a connection through the given transport, wraps it in BundleLayer and
-/// Session, sends the payload, then closes the connection.
+/// Session, sends the payload, waits for the receiver's delivery ACK, then closes.
 async fn try_send(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
@@ -178,7 +178,12 @@ async fn try_send(
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
     let mut session = Session::initiate(identity, bundled).await?;
-    session.send(payload).await
+    session.send(payload).await?;
+    // Quinn's write_all() buffers internally; CONNECTION_CLOSE fires when the last
+    // connection handle drops, which happens before the buffer is flushed. Waiting
+    // for the receiver's ACK keeps the connection alive until the data is delivered.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv()).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,12 +323,13 @@ mod tests {
         }
     }
 
-    /// Runs a responder: completes the Noise_XX handshake and receives one message.
-    /// Wraps the connection in BundleLayer to match what try_send does on the initiator side.
+    /// Runs a responder: completes the Noise_XX handshake, receives one message, and
+    /// sends an empty ACK so try_send() can return before dropping the connection.
     async fn run_responder(conn: TestConn, identity: NodeIdentity) {
         let bundled = Box::new(BundleLayer::new(Box::new(conn)));
         let mut session = Session::respond(&identity, bundled).await.unwrap();
         let _ = session.recv().await;
+        let _ = session.send(b"").await;
     }
 
     #[tokio::test]
