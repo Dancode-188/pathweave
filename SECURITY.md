@@ -34,9 +34,10 @@ handshake. Nobody reading the wire sees the content.
 
 Being clear about this matters.
 
-**Best-effort delivery only.** There are no at-least-once or exactly-once guarantees.
-`send()` returns Ok when bytes are handed to the transport. Whether they arrive is not
-guaranteed in this version.
+**Single-attempt confirmed delivery.** `send()` returns `Ok(())` when the receiver has
+acknowledged delivery via a session-level ACK round-trip. There is no automatic retry —
+if the connection fails before the ACK arrives, `send()` returns an error. At-least-once
+delivery with retry is v0.2.0.
 
 **No initiator identity hiding.** We use Noise_XX, where both sides reveal their static
 keys during the handshake. A passive observer who can intercept the handshake learns

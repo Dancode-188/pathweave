@@ -69,7 +69,7 @@ received. New transports should document their flushing behavior and confirm tha
 session ACK round-trip is sufficient to guarantee delivery for their protocol.
 
 BLE is not affected by the QUIC buffering issue, but the ACK is not optional on BLE
-either. GATT write-without-response has no link-layer delivery guarantee — the
+either. GATT write-without-response has no link-layer delivery guarantee: the
 characteristic write is fire-and-forget at the BLE protocol level. The Noise session
 ACK is the only confirmation that the payload reached the handler. The ACK is arguably
 more load-bearing on BLE than on QUIC, where at least Quinn confirms the bytes reached
