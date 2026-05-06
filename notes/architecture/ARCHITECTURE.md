@@ -240,25 +240,23 @@ Static priority fallback. That's what it is and what we call it.
 
 The routing gets real cost intelligence in v0.2.0. For now, free transport wins.
 
-**How the switch works: proactive health monitoring, lazy connections**
+**How the switch works: startup detection, lazy connections**
 
-The router runs a background task for each registered transport that monitors availability
-continuously. For QUIC, this means tracking connection health through keepalives and OS
-network events. For BLE, this means continuous scanning. Transport state is always current.
-
-When a transport's state changes (QUIC drops, BLE comes into range), the router reacts
-immediately -- not after a send() timeout. This is what makes the pw-chat demo work
-cleanly: when WiFi goes down, BLE is already in the router's known-reachable list and
-the switch is instant.
+The router runs a background task for each registered transport. The task calls `start()`
+and marks the transport available if it succeeds. In v0.1.0, that is the only availability
+check: transport state is set once at startup and never updated by the monitor.
 
 Connections are lazy. The router doesn't maintain active connections to every peer on
 every transport simultaneously. It maintains transport state (available/unavailable) and
-opens a connection on the best available transport when send() is called.
+opens a connection on the best available transport when `send()` is called.
 
-There is a narrow window between when a transport actually drops and when the monitoring
-task detects it. A send() call in that window will attempt the now-dead transport, get a
-transport error, and retry on the next best available transport. At most one message
-experiences this delay during a failover. This is acceptable behavior.
+When a transport that was available at startup becomes unavailable (network goes down, BLE
+goes out of range), the router does not detect this proactively. The next `send()` attempt
+on that transport fails, and the router falls back to the next available transport. At most
+one message experiences this latency during a failover.
+
+Proactive health monitoring (keepalives, OS network events, continuous BLE scanning) is a
+v0.2.0 addition.
 
 ---
 
@@ -489,7 +487,7 @@ The v0.1.0 demo. Two people run it. They're talking over QUIC. Internet goes dow
 app switches to BLE automatically. The conversation continues.
 
 ```
-pw-chat --peer 192.168.1.42:8080   // connect to a known QUIC address
+pw-chat --peer 192.168.1.42:9001   // connect to a known QUIC address
 pw-chat                             // listen mode -- accepts BLE and QUIC connections
 ```
 
