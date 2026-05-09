@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 
@@ -9,6 +10,55 @@ use crate::{
     BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError,
     PeerAnnouncement, PeerId, Result, Router, Session, Transport, TransportEvent,
 };
+
+const DEDUP_TTL: Duration = Duration::from_secs(60);
+
+/// Tracks recently seen (PeerId, message_id) pairs to suppress duplicate deliveries.
+///
+/// A retry that arrives after a lost ACK carries the same message ID as the original.
+/// The cache detects this and suppresses the second on_message() call while still
+/// sending the ACK so the sender does not time out. Entries expire after DEDUP_TTL.
+struct DeduplicationCache {
+    seen: HashMap<(PeerId, u64), Instant>,
+    ttl: Duration,
+}
+
+impl DeduplicationCache {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            ttl: DEDUP_TTL,
+        }
+    }
+
+    /// Returns true if (peer_id, message_id) was seen within the TTL window.
+    ///
+    /// If not seen before, records the pair and returns false. Expired entries
+    /// are evicted lazily on each call.
+    fn check_and_insert(&mut self, peer_id: &PeerId, message_id: u64) -> bool {
+        let now = Instant::now();
+        let ttl = self.ttl;
+        self.seen.retain(|_, inserted_at| {
+            now.checked_duration_since(*inserted_at)
+                .map(|age| age < ttl)
+                .unwrap_or(true)
+        });
+        let key = (peer_id.clone(), message_id);
+        if self.seen.contains_key(&key) {
+            return true;
+        }
+        self.seen.insert(key, now);
+        false
+    }
+
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            seen: HashMap::new(),
+            ttl,
+        }
+    }
+}
 
 /// The top-level entry point for the Pathweave library.
 ///
@@ -26,6 +76,7 @@ pub struct PathweaveNode {
     identity: NodeIdentity,
     peers: HashMap<PeerId, PeerAnnouncement>,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+    dedup: Arc<Mutex<DeduplicationCache>>,
 }
 
 impl PathweaveNode {
@@ -37,6 +88,7 @@ impl PathweaveNode {
             identity,
             peers: HashMap::new(),
             handler: Arc::new(Mutex::new(None)),
+            dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
         })
     }
 
@@ -49,8 +101,9 @@ impl PathweaveNode {
         let arc: Arc<dyn Transport> = Arc::from(transport);
         let identity = self.identity.clone();
         let handler = Arc::clone(&self.handler);
+        let dedup = Arc::clone(&self.dedup);
         let started = self.router.register_transport(Arc::clone(&arc));
-        tokio::spawn(accept_loop(arc, identity, handler, started));
+        tokio::spawn(accept_loop(arc, identity, handler, dedup, started));
     }
 
     /// Dials `announcement`, completes the Noise_XX handshake as the initiator, stores
@@ -115,6 +168,7 @@ async fn accept_loop(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+    dedup: Arc<Mutex<DeduplicationCache>>,
     started: Arc<Notify>,
 ) {
     started.notified().await;
@@ -123,7 +177,8 @@ async fn accept_loop(
             Ok(conn) => {
                 let identity = identity.clone();
                 let handler = Arc::clone(&handler);
-                tokio::spawn(handle_incoming(conn, identity, handler));
+                let dedup = Arc::clone(&dedup);
+                tokio::spawn(handle_incoming(conn, identity, handler, dedup));
             }
             Err(e) => {
                 tracing::debug!(transport = transport.name(), "accept error: {}", e);
@@ -135,10 +190,16 @@ async fn accept_loop(
 
 /// Completes the Noise_XX handshake as the responder, then loops receiving
 /// messages and delivering them to the handler until the connection closes.
+///
+/// Each payload begins with an 8-byte big-endian message ID. The ID is checked
+/// against the deduplication cache: if the (peer_id, message_id) pair was seen
+/// recently, on_message() is skipped. The ACK is sent regardless so the sender
+/// does not time out (see ADR 009 and ADR 011).
 async fn handle_incoming(
     conn: Box<dyn Connection>,
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+    dedup: Arc<Mutex<DeduplicationCache>>,
 ) {
     let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(conn));
     let mut session = match Session::respond(&identity, bundled).await {
@@ -150,14 +211,28 @@ async fn handle_incoming(
     };
     let peer_id = session.peer_id().clone();
     while let Ok(payload) = session.recv().await {
-        {
+        if payload.len() < 8 {
+            tracing::debug!(peer = %peer_id, "received payload shorter than 8 bytes; skipping");
+            let _ = session.send(b"").await;
+            continue;
+        }
+        let msg_id = u64::from_be_bytes([
+            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+            payload[7],
+        ]);
+        let data = payload[8..].to_vec();
+
+        let is_dup = dedup.lock().unwrap().check_and_insert(&peer_id, msg_id);
+        if !is_dup {
             let guard = handler.lock().unwrap();
             if let Some(h) = guard.as_ref() {
-                h.on_message(peer_id.clone(), payload.to_vec());
+                h.on_message(peer_id.clone(), data);
             }
+        } else {
+            tracing::debug!(peer = %peer_id, "suppressed duplicate message");
         }
         // ACK so the sender knows the data was delivered before it tears
-        // down the QUIC connection (see try_send in router.rs).
+        // down the QUIC connection (see try_send in router.rs and ADR 009).
         let _ = session.send(b"").await;
     }
 }
@@ -474,7 +549,12 @@ mod tests {
         tokio::spawn(async move {
             let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(client_conn)));
             let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
-            session.send(b"hello from peer").await.unwrap();
+            // Prepend the 8-byte message ID as handle_incoming now expects (ADR 011).
+            let msg_id: u64 = 0x0102030405060708;
+            let mut framed = Vec::with_capacity(8 + b"hello from peer".len());
+            framed.extend_from_slice(&msg_id.to_be_bytes());
+            framed.extend_from_slice(b"hello from peer");
+            session.send(&framed).await.unwrap();
         });
 
         let payload = tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
@@ -524,5 +604,115 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
+    }
+
+    // --- DeduplicationCache unit tests ---------------------------------------
+
+    #[test]
+    fn dedup_cache_first_insert_not_duplicate() {
+        let mut cache = DeduplicationCache::new();
+        let peer = NodeIdentity::generate().peer_id().clone();
+        assert!(!cache.check_and_insert(&peer, 42));
+    }
+
+    #[test]
+    fn dedup_cache_second_insert_same_key_is_duplicate() {
+        let mut cache = DeduplicationCache::new();
+        let peer = NodeIdentity::generate().peer_id().clone();
+        cache.check_and_insert(&peer, 42);
+        assert!(cache.check_and_insert(&peer, 42));
+    }
+
+    #[test]
+    fn dedup_cache_different_message_id_not_duplicate() {
+        let mut cache = DeduplicationCache::new();
+        let peer = NodeIdentity::generate().peer_id().clone();
+        cache.check_and_insert(&peer, 1);
+        assert!(!cache.check_and_insert(&peer, 2));
+    }
+
+    #[test]
+    fn dedup_cache_different_peer_same_id_not_duplicate() {
+        let mut cache = DeduplicationCache::new();
+        let peer_a = NodeIdentity::generate().peer_id().clone();
+        let peer_b = NodeIdentity::generate().peer_id().clone();
+        cache.check_and_insert(&peer_a, 42);
+        assert!(!cache.check_and_insert(&peer_b, 42));
+    }
+
+    #[test]
+    fn dedup_cache_entry_redeliverable_after_ttl_expires() {
+        let mut cache = DeduplicationCache::with_ttl(Duration::from_millis(10));
+        let peer = NodeIdentity::generate().peer_id().clone();
+        cache.check_and_insert(&peer, 99);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!cache.check_and_insert(&peer, 99));
+    }
+
+    // --- duplicate suppression integration test ------------------------------
+
+    #[tokio::test]
+    async fn duplicate_message_delivered_only_once() {
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
+        let transport = AcceptMockTransport {
+            conn_rx: tokio::sync::Mutex::new(conn_rx),
+        };
+
+        let receiver_id = NodeIdentity::generate();
+        let sender_id = NodeIdentity::generate();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct CountingHandler {
+            count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl MessageHandler for CountingHandler {
+            fn on_message(&self, _peer_id: PeerId, _payload: Vec<u8>) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(transport));
+        node.on_message(Box::new(CountingHandler {
+            count: Arc::clone(&call_count),
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let msg_id: u64 = 0xDEADBEEFCAFEBABE;
+        let mut framed = Vec::with_capacity(8 + b"hello".len());
+        framed.extend_from_slice(&msg_id.to_be_bytes());
+        framed.extend_from_slice(b"hello");
+
+        // Send two connections from the same sender with the same message ID.
+        for _ in 0..2 {
+            let (client_conn, server_conn) = conn_pair();
+            conn_tx
+                .send(Box::new(server_conn))
+                .expect("transport still alive");
+            let sender_id = sender_id.clone();
+            let framed = framed.clone();
+            tokio::spawn(async move {
+                let bundled: Box<dyn Connection> =
+                    Box::new(BundleLayer::new(Box::new(client_conn)));
+                let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
+                session.send(&framed).await.unwrap();
+                // Wait for the ACK so handle_incoming has time to process.
+                let _ =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(2), session.recv()).await;
+            });
+        }
+
+        // Give both connections time to be fully processed.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            1,
+            "on_message must be called exactly once for a duplicated message"
+        );
     }
 }

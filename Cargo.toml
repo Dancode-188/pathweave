@@ -51,5 +51,8 @@ clap = { version = "4", features = ["derive"] }
 # bundle protocol
 bp7 = { version = "0.10", default-features = false }
 
+# entropy
+getrandom = "0.2"
+
 # testing
 proptest = "1"
