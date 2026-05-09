@@ -220,8 +220,9 @@ pub enum TransportCost {
 }
 ```
 
-Simple for v0.1.0. Gets richer in v0.2.0 when we add real cost intelligence: battery
-level, signal quality, payload size, WiFi vs mobile data.
+Simple for v0.1.0. Gets richer in v0.2.0: WiFi vs mobile data detection for QUIC
+replaces the blanket Metered default. Battery level, signal quality, and payload-size
+routing are deferred beyond v0.2.0.
 
 `Metered` covers two situations that are not the same: QUIC over WiFi (flat monthly fee,
 functionally free) and QUIC over mobile data (per-megabyte, genuinely metered). Detecting
@@ -322,7 +323,7 @@ before you connect. Noise_XK requires knowing the responder's key before initiat
 means you can't use it for unknown nearby peers. Noise_XX lets both sides reveal keys
 during the handshake, so you can connect to anyone you discover.
 
-Noise_XK is the v0.2.0 upgrade, once we have a contact and key registry. The pattern
+Noise_XK is the v0.3.0 upgrade, once we have a contact and key registry. The pattern
 string changes; the crate doesn't.
 
 After the handshake, the peer's static public key is known. PeerId is derived here.
@@ -513,7 +514,7 @@ Being clear about this matters as much as being clear about what it does.
 - No at-least-once delivery
 - No automatic QUIC peer discovery (mDNS)
 - No multi-hop BLE routing (single-hop only)
-- No contact or key registry (Noise_XK upgrade deferred to v0.2.0)
+- No contact or key registry (Noise_XK upgrade deferred to v0.3.0)
 - No BLE peripheral mode (advertising) on macOS or Windows (deferred to v0.2.0)
 - No security audit completed
 

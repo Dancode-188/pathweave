@@ -1,4 +1,4 @@
-# ADR 001: Use Noise_XX for v0.1.0, defer Noise_XK to v0.2.0
+# ADR 001: Use Noise_XX for v0.1.0, defer Noise_XK to v0.3.0
 
 **Status:** Accepted
 
@@ -27,6 +27,6 @@ Both parties' static public keys are visible to a passive observer who can inter
 the handshake. This is a known limitation of Noise_XX and is documented in SECURITY.md
 under "What v0.1.0 does not provide."
 
-Noise_XK, which hides the initiator's identity, becomes the v0.2.0 upgrade once we have
+Noise_XK, which hides the initiator's identity, becomes the v0.3.0 upgrade once we have
 a contact and key registry. The pattern string changes; the snow crate and everything
 else stays the same.
