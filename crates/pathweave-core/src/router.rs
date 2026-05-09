@@ -63,12 +63,18 @@ impl Router {
     /// Tries transports in cost order (Free first). On connection or handshake
     /// failure, falls back to the next available transport. Returns
     /// NoTransportAvailable if no registered transport is available or all fail.
+    ///
+    /// A random 8-byte message ID is generated once per call and passed to
+    /// try_send(). The receiver uses this ID for deduplication so that future
+    /// retry attempts (issue #43) do not double-deliver.
     pub async fn send(
         &self,
         peer: &PeerAnnouncement,
         identity: &NodeIdentity,
         payload: Vec<u8>,
     ) -> Result<()> {
+        let message_id = new_message_id();
+
         let mut candidates: Vec<&TransportEntry> = self
             .transports
             .iter()
@@ -82,7 +88,7 @@ impl Router {
         });
 
         for entry in candidates {
-            if try_send(entry.transport.as_ref(), peer, identity, &payload)
+            if try_send(entry.transport.as_ref(), peer, identity, &payload, message_id)
                 .await
                 .is_ok()
             {
@@ -174,18 +180,35 @@ async fn try_connect(
     Ok(session.peer_id().clone())
 }
 
+/// Generates a cryptographically random 64-bit message ID from OS entropy.
+///
+/// Panics if the system entropy source is unavailable — the same condition
+/// that would have already caused NodeIdentity::generate() to panic.
+fn new_message_id() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).expect("system entropy unavailable");
+    u64::from_be_bytes(bytes)
+}
+
 /// Opens a connection through the given transport, wraps it in BundleLayer and
-/// Session, sends the payload, waits for the receiver's delivery ACK, then closes.
+/// Session, prepends the 8-byte message ID for receiver-side deduplication,
+/// sends the framed payload, waits for the receiver's delivery ACK, then closes.
 async fn try_send(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
     identity: &NodeIdentity,
     payload: &[u8],
+    message_id: u64,
 ) -> Result<()> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
     let mut session = Session::initiate(identity, bundled).await?;
-    session.send(payload).await?;
+
+    let mut framed = Vec::with_capacity(8 + payload.len());
+    framed.extend_from_slice(&message_id.to_be_bytes());
+    framed.extend_from_slice(payload);
+
+    session.send(&framed).await?;
     // Quinn's write_all() buffers internally; CONNECTION_CLOSE fires when the last
     // connection handle drops, which happens before the buffer is flushed. Waiting
     // for the receiver's ACK keeps the connection alive until the data is delivered.
