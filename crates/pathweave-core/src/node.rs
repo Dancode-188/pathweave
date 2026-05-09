@@ -217,8 +217,8 @@ async fn handle_incoming(
             continue;
         }
         let msg_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-            payload[4], payload[5], payload[6], payload[7],
+            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+            payload[7],
         ]);
         let data = payload[8..].to_vec();
 
@@ -702,11 +702,8 @@ mod tests {
                 let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
                 session.send(&framed).await.unwrap();
                 // Wait for the ACK so handle_incoming has time to process.
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(2),
-                    session.recv(),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(2), session.recv()).await;
             });
         }
 

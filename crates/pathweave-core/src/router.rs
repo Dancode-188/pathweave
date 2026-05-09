@@ -88,9 +88,15 @@ impl Router {
         });
 
         for entry in candidates {
-            if try_send(entry.transport.as_ref(), peer, identity, &payload, message_id)
-                .await
-                .is_ok()
+            if try_send(
+                entry.transport.as_ref(),
+                peer,
+                identity,
+                &payload,
+                message_id,
+            )
+            .await
+            .is_ok()
             {
                 return Ok(());
             }
