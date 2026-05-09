@@ -1198,6 +1198,7 @@ dependencies = [
  "bs58",
  "bytes",
  "futures",
+ "getrandom 0.2.17",
  "proptest",
  "snow",
  "thiserror 2.0.18",
