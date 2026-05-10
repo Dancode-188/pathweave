@@ -22,6 +22,8 @@ pub type Result<T> = std::result::Result<T, PathweaveError>;
 pub enum PathweaveError {
     #[error("no transport available to reach peer")]
     NoTransportAvailable,
+    #[error("delivery failed: all retry attempts exhausted without confirmation")]
+    DeliveryFailed,
     #[error("transport error: {0}")]
     Transport(String),
     #[error("session error: {0}")]

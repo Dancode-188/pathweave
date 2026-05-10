@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::stream::{self, BoxStream};
 use tokio::sync::{broadcast, Notify};
@@ -9,6 +10,9 @@ use crate::{
     BundleLayer, NodeIdentity, PathweaveError, PeerAnnouncement, PeerId, Result, Session,
     Transport, TransportCost, TransportEvent,
 };
+
+const MAX_SEND_ATTEMPTS: usize = 3;
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 struct TransportEntry {
     transport: Arc<dyn Transport>,
@@ -58,51 +62,65 @@ impl Router {
         started
     }
 
-    /// Sends `payload` to `peer` through the lowest-cost available transport.
+    /// Sends `payload` to `peer`, retrying up to MAX_SEND_ATTEMPTS times.
     ///
-    /// Tries transports in cost order (Free first). On connection or handshake
-    /// failure, falls back to the next available transport. Returns
-    /// NoTransportAvailable if no registered transport is available or all fail.
+    /// A random 8-byte message ID is generated once per call and reused across all
+    /// retry attempts. The receiver's deduplication cache suppresses duplicate delivery
+    /// when the same ID arrives more than once (ADR 011).
     ///
-    /// A random 8-byte message ID is generated once per call and passed to
-    /// try_send(). The receiver uses this ID for deduplication so that future
-    /// retry attempts (issue #43) do not double-deliver.
+    /// Returns NoTransportAvailable immediately if no transport is currently available.
+    /// Returns DeliveryFailed if all attempts across all available transports are
+    /// exhausted without receiving a delivery ACK.
     pub async fn send(
         &self,
         peer: &PeerAnnouncement,
         identity: &NodeIdentity,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let message_id = new_message_id();
-
-        let mut candidates: Vec<&TransportEntry> = self
+        let any_available = self
             .transports
             .iter()
-            .filter(|t| t.available.load(Ordering::Acquire))
-            .collect();
+            .any(|t| t.available.load(Ordering::Acquire));
+        if !any_available {
+            return Err(PathweaveError::NoTransportAvailable);
+        }
 
-        candidates.sort_by_key(|t| match t.transport.cost() {
-            TransportCost::Free => 0u8,
-            TransportCost::Metered => 1,
-            TransportCost::Unknown => 2,
-        });
+        let message_id = new_message_id();
 
-        for entry in candidates {
-            if try_send(
-                entry.transport.as_ref(),
-                peer,
-                identity,
-                &payload,
-                message_id,
-            )
-            .await
-            .is_ok()
-            {
-                return Ok(());
+        for attempt in 0..MAX_SEND_ATTEMPTS {
+            let mut candidates: Vec<&TransportEntry> = self
+                .transports
+                .iter()
+                .filter(|t| t.available.load(Ordering::Acquire))
+                .collect();
+
+            candidates.sort_by_key(|t| match t.transport.cost() {
+                TransportCost::Free => 0u8,
+                TransportCost::Metered => 1,
+                TransportCost::Unknown => 2,
+            });
+
+            for entry in candidates {
+                if try_send(
+                    entry.transport.as_ref(),
+                    peer,
+                    identity,
+                    &payload,
+                    message_id,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+
+            if attempt + 1 < MAX_SEND_ATTEMPTS {
+                tokio::time::sleep(RETRY_BACKOFF).await;
             }
         }
 
-        Err(PathweaveError::NoTransportAvailable)
+        Err(PathweaveError::DeliveryFailed)
     }
 
     /// Dials `peer`, completes the Noise_XX handshake as the initiator, and returns
@@ -218,8 +236,11 @@ async fn try_send(
     // Quinn's write_all() buffers internally; CONNECTION_CLOSE fires when the last
     // connection handle drops, which happens before the buffer is flushed. Waiting
     // for the receiver's ACK keeps the connection alive until the data is delivered.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv()).await;
-    Ok(())
+    match tokio::time::timeout(Duration::from_secs(5), session.recv()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(PathweaveError::Transport("delivery ACK timed out".into())),
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +295,7 @@ mod tests {
         cost: TransportCost,
         kind: TransportKind,
         fail_connect: bool,
+        remaining_failures: Arc<AtomicUsize>,
         responder_tx: UnboundedSender<TestConn>,
         connect_count: Arc<AtomicUsize>,
     }
@@ -296,6 +318,20 @@ mod tests {
             self.connect_count.fetch_add(1, Ordering::Relaxed);
             if self.fail_connect {
                 return Err(PathweaveError::Transport("mock: connect failed".into()));
+            }
+            // Transient failures: decrement remaining_failures; fail while non-zero.
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(PathweaveError::Transport("mock: transient failure".into()));
             }
             let (a, b) = conn_pair();
             self.responder_tx.send(b).ok();
@@ -344,6 +380,32 @@ mod tests {
                 cost,
                 kind,
                 fail_connect,
+                remaining_failures: Arc::new(AtomicUsize::new(0)),
+                responder_tx: tx,
+                connect_count: Arc::clone(&count),
+            }),
+            rx,
+            count,
+        )
+    }
+
+    fn make_transport_with_failures(
+        cost: TransportCost,
+        kind: TransportKind,
+        initial_failures: usize,
+    ) -> (
+        Arc<MockTransport>,
+        UnboundedReceiver<TestConn>,
+        Arc<AtomicUsize>,
+    ) {
+        let (tx, rx) = unbounded_channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MockTransport {
+                cost,
+                kind,
+                fail_connect: false,
+                remaining_failures: Arc::new(AtomicUsize::new(initial_failures)),
                 responder_tx: tx,
                 connect_count: Arc::clone(&count),
             }),
@@ -443,10 +505,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn send_returns_no_transport_when_all_fail() {
-        let (ble, _ble_rx, _) = make_transport(TransportCost::Free, TransportKind::Ble, true);
-        let (quic, _quic_rx, _) = make_transport(TransportCost::Metered, TransportKind::Quic, true);
+    #[tokio::test(start_paused = true)]
+    async fn send_returns_delivery_failed_when_all_transports_fail() {
+        let (ble, _ble_rx, ble_count) =
+            make_transport(TransportCost::Free, TransportKind::Ble, true);
+        let (quic, _quic_rx, quic_count) =
+            make_transport(TransportCost::Metered, TransportKind::Quic, true);
 
         let mut router = Router::new();
         router.register_transport(ble);
@@ -461,8 +525,18 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(PathweaveError::NoTransportAvailable)),
-            "expected NoTransportAvailable, got: {result:?}"
+            matches!(result, Err(PathweaveError::DeliveryFailed)),
+            "expected DeliveryFailed, got: {result:?}"
+        );
+        assert_eq!(
+            ble_count.load(Ordering::Relaxed),
+            MAX_SEND_ATTEMPTS,
+            "BLE should be tried once per attempt"
+        );
+        assert_eq!(
+            quic_count.load(Ordering::Relaxed),
+            MAX_SEND_ATTEMPTS,
+            "QUIC should be tried once per attempt"
         );
     }
 
@@ -474,6 +548,62 @@ mod tests {
             .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_succeeds_on_retry_after_transient_failure() {
+        // Transport fails the first connect, then succeeds.
+        let (transport, mut rx, count) =
+            make_transport_with_failures(TransportCost::Free, TransportKind::Ble, 1);
+
+        let mut router = Router::new();
+        router.register_transport(transport);
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let sender_id = NodeIdentity::generate();
+        let responder_id = NodeIdentity::generate();
+
+        tokio::spawn(async move {
+            let conn = rx.recv().await.unwrap();
+            run_responder(conn, responder_id).await;
+        });
+
+        router
+            .send(&dummy_peer(), &sender_id, b"hello".to_vec())
+            .await
+            .unwrap();
+
+        // First attempt failed (transient), second succeeded: 2 total connects.
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_returns_no_transport_when_none_available_after_precheck() {
+        // Transports are registered but their availability flags never flip to true
+        // because we skip the yield_now() calls. Pre-check should catch this fast.
+        let (ble, _ble_rx, ble_count) =
+            make_transport(TransportCost::Free, TransportKind::Ble, false);
+
+        let mut router = Router::new();
+        router.register_transport(ble);
+
+        // No yield: monitoring task has not run, available = false.
+        let sender_id = NodeIdentity::generate();
+        let result = router
+            .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
+            .await;
+
+        assert!(
+            matches!(result, Err(PathweaveError::NoTransportAvailable)),
+            "expected NoTransportAvailable, got: {result:?}"
+        );
+        assert_eq!(
+            ble_count.load(Ordering::Relaxed),
+            0,
+            "no connect attempts should be made"
+        );
     }
 
     #[tokio::test]
