@@ -99,9 +99,6 @@ tree and `accept()` returns the existing not-implemented error.
 struct BlePeripheralState {
     _adv_handle: bluer::adv::AdvertisementHandle,
     _app_handle: bluer::gatt::local::ApplicationHandle,
-    conn_rx: Arc<tokio::sync::Mutex<
-        tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>
-    >>,
 }
 ```
 
@@ -109,10 +106,18 @@ struct BlePeripheralState {
 the advertisement and the GATT application when they are dropped. The `_` prefix
 makes the intent explicit.
 
-`conn_rx` is wrapped in `Arc<tokio::sync::Mutex<...>>` so `accept()` can clone the
-Arc, release the outer `self.peripheral` lock, and then await `recv()` without
-holding the outer lock. This prevents a deadlock when `stop()` needs to acquire
-the same outer lock while `accept()` is blocked. See the `accept()` section below.
+`conn_rx` (the receiver side of the connection channel created in
+`start_peripheral()`) is held on `BleTransport` directly as a separate field:
+
+```rust
+#[cfg(target_os = "linux")]
+conn_rx: tokio::sync::Mutex<Option<
+    tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>
+>>,
+```
+
+See the `accept()` section for why it lives here rather than inside
+`BlePeripheralState`.
 
 Dropping `BlePeripheralState` in `stop()` drops the two handles, which closes the
 characteristic control streams in `peripheral_loop`, which causes it to return and
@@ -156,7 +161,8 @@ correctly with this layout.
 5. Call `adapter.advertise(adv).await`; retain `AdvertisementHandle`.
 6. Create an unbounded channel `(conn_tx, conn_rx)`.
 7. Spawn `peripheral_loop(write_ctrl, notify_ctrl, conn_tx)`.
-8. Store `BlePeripheralState { _adv_handle, _app_handle, conn_rx: Arc::new(Mutex::new(conn_rx)) }`.
+8. Store `conn_rx` in `self.conn_rx`, then store
+   `BlePeripheralState { _adv_handle, _app_handle }` in `self.peripheral`.
 
 On non-Linux platforms, `start()` uses `_identity` and performs the existing
 btleplug adapter initialization unchanged.
@@ -174,15 +180,18 @@ async fn peripheral_loop(
     conn_tx: UnboundedSender<BlePeripheralConnection>,
 ) {
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    let mut writer: Option<CharacteristicWriter> = None;
+    let mut writer = None;
     let mut active_write_tx: Option<UnboundedSender<Bytes>> = None;
 
     loop {
         tokio::select! {
             evt = notify_ctrl.next() => match evt {
                 Some(CharacteristicControlEvent::Notify(w)) => {
-                    if active_write_tx.is_some() {
-                        // v0.2.0 supports one central at a time.
+                    // Check is_closed() not just is_some(): after a connection
+                    // completes and write_rx is dropped, active_write_tx stays
+                    // Some(dead_sender). is_closed() detects this and allows
+                    // the next subscriber to open a fresh connection.
+                    if active_write_tx.as_ref().is_some_and(|tx| !tx.is_closed()) {
                         tracing::debug!("BLE peripheral: second subscriber while connection active; ignored");
                     } else {
                         writer = Some(w);
@@ -202,10 +211,10 @@ async fn peripheral_loop(
                         Some(tx) => {
                             if let Ok(mut reader) = req.accept() {
                                 let mut buf = Vec::new();
-                                if tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf).await.is_ok() {
-                                    if tx.send(Bytes::from(buf)).is_err() {
-                                        active_write_tx = None;
-                                    }
+                                if tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf).await.is_ok()
+                                    && tx.send(Bytes::from(buf)).is_err()
+                                {
+                                    active_write_tx = None;
                                 }
                             }
                         }
@@ -253,22 +262,21 @@ write events from the same subscriber. Reply bytes flow from connections through
 ```rust
 #[cfg(target_os = "linux")]
 async fn accept(&self) -> Result<Box<dyn Connection>> {
-    let rx = {
-        let guard = self.peripheral.lock().await;
-        let state = guard.as_ref()
-            .ok_or_else(|| PathweaveError::Transport("transport not started".into()))?;
-        Arc::clone(&state.conn_rx)
-    }; // outer Mutex released before awaiting
-    rx.lock().await.recv().await
-        .map(|c| Box::new(c) as Box<dyn Connection>)
-        .ok_or_else(|| PathweaveError::Transport("peripheral loop ended".into()))
+    let mut guard = self.conn_rx.lock().await;
+    match guard.as_mut() {
+        Some(rx) => rx
+            .recv()
+            .await
+            .map(|c| Box::new(c) as Box<dyn Connection>)
+            .ok_or_else(|| PathweaveError::Transport("peripheral loop ended".into())),
+        None => Err(PathweaveError::Transport("transport not started".into())),
+    }
 }
 ```
 
-The outer `self.peripheral` lock is acquired only to clone the `Arc<Mutex<...>>`
-for `conn_rx`. It is released before `recv()` blocks. This allows `stop()` to
-acquire `self.peripheral`, drop `BlePeripheralState`, and unblock the waiting
-`recv()` without deadlock.
+The guard on `self.conn_rx` is held across `recv()`. See the rationale section for
+why this is safe with respect to `stop()`, and why `conn_rx` must live on
+`BleTransport` rather than inside `BlePeripheralState`.
 
 ### BlePeripheralConnection
 
@@ -347,22 +355,46 @@ routed to the wrong writer. Silent replacement produces confused state; an expli
 rejection with a debug log is predictable and honest about the v0.2.0 limitation.
 The at-least-once retry loop on the first central handles the missed ACK.
 
-**Why release the outer lock before recv() in accept()?**
+**Why does conn_rx live on BleTransport rather than inside BlePeripheralState?**
 
-`stop()` calls `transport.stop().await`, which must acquire `self.peripheral` to
-drop `BlePeripheralState`. If `accept()` holds that lock across the blocking
-`recv()` call, `stop()` waits for the lock. But the unblock signal (`conn_tx` drop
-that causes `recv()` to return `None`) only arrives after `BlePeripheralState` is
-dropped, which requires `stop()` to acquire the lock first: a deadlock. Cloning the
-Arc before releasing the lock breaks the cycle: `stop()` can acquire the outer lock,
-drop the state and its handles, which closes `peripheral_loop` and drops `conn_tx`,
-which causes the already-waiting `recv()` to return `None`.
+Two constraints interact here.
+
+The deadlock constraint: `stop()` must acquire `self.peripheral` to drop
+`BlePeripheralState`. The unblock signal that causes `recv()` to return `None`
+(the `conn_tx` drop via `peripheral_loop` exit) only arrives after
+`BlePeripheralState` is dropped. So `accept()` cannot hold `self.peripheral` across
+`recv()` without creating a deadlock.
+
+The async_trait lifetime constraint: `async_trait` transforms `accept()` into
+`Box<dyn Future + Send + 'async_trait>` where `'life0: 'async_trait` (`'life0` is
+the lifetime of `&self`). Any borrow held across an `.await` point inside that
+future must also satisfy `'life0: 'async_trait`.
+
+The first instinct is to clone an `Arc<Mutex<conn_rx>>` from inside
+`BlePeripheralState`, release `self.peripheral`, then lock the inner Arc and await
+`recv()`. This avoids the peripheral-lock deadlock. But the borrow checker rejects
+it: the `MutexGuard` borrows from a local `Arc` variable with a lifetime shorter
+than `'async_trait`, and `async_trait` requires every borrow held across `.await` to
+satisfy `'life0: 'async_trait`. The compiler reports E0597.
+
+Moving `conn_rx` to `BleTransport` directly fixes both constraints. `accept()` locks
+`self.conn_rx` directly; the guard borrows from `self`, which has lifetime `'life0`,
+satisfying `'life0: 'async_trait`. And the `self.peripheral` lock is never held
+across `recv()`, so the deadlock cannot occur.
+
+The stop() + accept() interaction with this design: `stop()` acquires
+`self.peripheral`, drops `BlePeripheralState` (closing the GATT application and
+advertisement), and releases `self.peripheral`. `peripheral_loop` sees its control
+streams close, exits, and drops `conn_tx`. The `recv()` waiting in `accept()`
+returns `None`; `accept()` returns an error and releases the `conn_rx` guard. `stop()`
+then acquires `self.conn_rx` and clears it so subsequent `accept()` calls return
+"transport not started" rather than "peripheral loop ended".
 
 ## Implications
 
 - `bluer` is added as a `[target.'cfg(target_os = "linux")'.dependencies]` entry
   in `pathweave-transport-ble/Cargo.toml`.
-- `BleTransport` gains `peripheral` field, `BlePeripheralState`, and
+- `BleTransport` gains `peripheral` and `conn_rx` fields, `BlePeripheralState`, and
   `BlePeripheralConnection` under `#[cfg(target_os = "linux")]`.
 - `Transport::start()` signature changes to `start(&self, identity: &NodeIdentity)`.
 - `QuicTransport`, all mock transports in tests: add `_identity`.
