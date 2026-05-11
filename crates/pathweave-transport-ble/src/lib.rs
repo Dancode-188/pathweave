@@ -117,10 +117,10 @@ async fn peripheral_loop(
                         Some(tx) => {
                             if let Ok(mut reader) = req.accept() {
                                 let mut buf = Vec::new();
-                                if reader.read_to_end(&mut buf).await.is_ok() {
-                                    if tx.send(Bytes::from(buf)).is_err() {
-                                        active_write_tx = None;
-                                    }
+                                if reader.read_to_end(&mut buf).await.is_ok()
+                                    && tx.send(Bytes::from(buf)).is_err()
+                                {
+                                    active_write_tx = None;
                                 }
                             }
                         }
