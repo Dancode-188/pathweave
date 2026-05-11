@@ -1,14 +1,16 @@
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::stream::{self, BoxStream};
-use tokio::sync::{broadcast, Notify};
+use futures::stream::{self, BoxStream, StreamExt};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    BundleLayer, NodeIdentity, PathweaveError, PeerAnnouncement, PeerId, Result, Session,
-    Transport, TransportCost, TransportEvent,
+    BundleLayer, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, Result,
+    Session, Transport, TransportCost, TransportEvent,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
@@ -41,17 +43,18 @@ impl Router {
 
     /// Registers a transport and starts its availability monitoring task.
     ///
-    /// Returns a `Notify` that fires once after `start()` succeeds. Callers that
-    /// need to wait until the transport is ready (e.g. the accept loop) should
-    /// await `notified()` on the returned handle before proceeding.
-    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) -> Arc<Notify> {
+    /// Returns a watch receiver that fires once `start()` succeeds. Callers
+    /// that need to wait until the transport is ready (e.g. the accept loop or
+    /// the discover loop) should `wait_for(|v| *v).await` on a clone of the
+    /// returned receiver. Unlike `Notify`, a watch receiver that arrives late
+    /// still sees `true` because the value is retained.
+    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) -> watch::Receiver<bool> {
         let available = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(Notify::new());
+        let (started_tx, started_rx) = watch::channel(false);
 
         let t = Arc::clone(&transport);
         let a = Arc::clone(&available);
-        let s = Arc::clone(&started);
-        let task = tokio::spawn(monitor(t, a, s));
+        let task = tokio::spawn(monitor(t, a, started_tx));
 
         self.transports.push(TransportEntry {
             transport,
@@ -59,7 +62,7 @@ impl Router {
             task,
         });
 
-        started
+        started_rx
     }
 
     /// Sends `payload` to `peer`, retrying up to MAX_SEND_ATTEMPTS times.
@@ -181,12 +184,18 @@ impl Drop for Router {
     }
 }
 
-/// Monitors a single transport. Marks it available after start() succeeds, signals
-/// `started` so the accept loop can begin, then parks until the router is dropped.
-async fn monitor(transport: Arc<dyn Transport>, available: Arc<AtomicBool>, started: Arc<Notify>) {
+/// Monitors a single transport. Marks it available after start() succeeds,
+/// signals `started` so waiting tasks can begin, then parks until the router
+/// is dropped. Using a watch::Sender means any task that subscribes late still
+/// sees the `true` value without a race.
+async fn monitor(
+    transport: Arc<dyn Transport>,
+    available: Arc<AtomicBool>,
+    started: watch::Sender<bool>,
+) {
     if transport.start().await.is_ok() {
         available.store(true, Ordering::Release);
-        started.notify_one();
+        let _ = started.send(true);
         std::future::pending::<()>().await;
     }
 }
@@ -240,6 +249,57 @@ async fn try_send(
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(PathweaveError::Transport("delivery ACK timed out".into())),
+    }
+}
+
+/// Drives mDNS peer discovery for a single transport.
+///
+/// Waits for the transport to start, then drains its discover() stream. For
+/// each announced address that is not already in `known_addrs`, performs a
+/// Noise_XX handshake to learn the remote PeerId. On success, upserts the
+/// PeerId -> PeerAnnouncement mapping into the shared peer table. On failure,
+/// removes the address from `known_addrs` so the next re-announcement retries.
+/// Skips self-announcements by comparing the remote PeerId with `local_peer_id`.
+///
+/// Address-based dedup (not PeerId-based) handles peer roaming: if a known
+/// peer reappears at a new address, the new address is not in `known_addrs`
+/// and a fresh handshake is performed, updating the peer table entry.
+pub(crate) async fn peer_stream(
+    transport: Arc<dyn Transport>,
+    identity: NodeIdentity,
+    mut started: watch::Receiver<bool>,
+    peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
+    known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
+    local_peer_id: PeerId,
+) {
+    let _ = started.wait_for(|v| *v).await;
+    let mut discover = transport.discover();
+    while let Some(announcement) = discover.next().await {
+        let addr = match &announcement.address {
+            PeerAddress::Quic(addr) => *addr,
+            _ => continue,
+        };
+
+        // Skip re-announcements from already-connected addresses (O(1) check).
+        if !known_addrs.lock().unwrap().insert(addr) {
+            continue;
+        }
+
+        match try_connect(transport.as_ref(), &announcement, &identity).await {
+            Ok(peer_id) if peer_id == local_peer_id => {
+                // Self-discovery: keep addr in known_addrs so we don't retry.
+                tracing::debug!(addr = %addr, "mDNS: discovered self; skipping");
+            }
+            Ok(peer_id) => {
+                tracing::debug!(addr = %addr, peer = %peer_id, "mDNS: peer connected");
+                peers.lock().unwrap().insert(peer_id, announcement);
+            }
+            Err(e) => {
+                tracing::debug!(addr = %addr, "mDNS: handshake failed: {}", e);
+                // Remove so we retry on the next re-announcement.
+                known_addrs.lock().unwrap().remove(&addr);
+            }
+        }
     }
 }
 
@@ -310,7 +370,7 @@ mod tests {
             Ok(())
         }
 
-        fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
             Box::pin(stream::empty())
         }
 

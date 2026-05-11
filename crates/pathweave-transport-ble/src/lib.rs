@@ -82,7 +82,7 @@ impl Transport for BleTransport {
     /// for the Pathweave service UUID and decodes the short_id from service data.
     /// The stream ends when the sender is dropped (i.e., after `stop()` clears the
     /// adapter and the event stream closes).
-    fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
+    fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
         let adapter_arc = Arc::clone(&self.adapter);
         let (tx, rx) = mpsc::unbounded::<PeerAnnouncement>();
 
