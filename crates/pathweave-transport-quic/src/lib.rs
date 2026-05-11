@@ -1,8 +1,12 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use pathweave_core::{
     Connection, PathweaveError, PeerAddress, PeerAnnouncement, Result, Transport, TransportCost,
     TransportKind,
@@ -19,6 +23,20 @@ use quinn::{
 use rcgen::CertifiedKey;
 use tokio::sync::Mutex;
 
+const SERVICE_TYPE: &str = "_pathweave._udp.local.";
+
+// --------------------------------------------------------------------------
+// mDNS state
+// --------------------------------------------------------------------------
+
+struct MdnsState {
+    daemon: ServiceDaemon,
+    service_fullname: String,
+    // Taken by discover() on first call; None afterwards.
+    announce_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerAnnouncement>>,
+    bridge: tokio::task::JoinHandle<()>,
+}
+
 // --------------------------------------------------------------------------
 // Transport
 // --------------------------------------------------------------------------
@@ -26,13 +44,20 @@ use tokio::sync::Mutex;
 pub struct QuicTransport {
     listen_addr: SocketAddr,
     endpoint: Mutex<Option<Endpoint>>,
+    mdns: std::sync::Mutex<Option<MdnsState>>,
+    instance_name: String,
 }
 
 impl QuicTransport {
     pub fn new(listen_addr: SocketAddr) -> Self {
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).expect("system entropy unavailable");
+        let instance_name = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         Self {
             listen_addr,
             endpoint: Mutex::new(None),
+            mdns: std::sync::Mutex::new(None),
+            instance_name,
         }
     }
 
@@ -44,6 +69,22 @@ impl QuicTransport {
             .as_ref()
             .and_then(|e| e.local_addr().ok())
     }
+}
+
+/// Finds the local IPv4 address the OS would route through when reaching an
+/// external host. Opens a UDP socket but sends no packets — just queries the
+/// routing table. Falls back to loopback if the query fails.
+fn local_ipv4() -> Ipv4Addr {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| {
+            s.connect("8.8.8.8:80").ok()?;
+            match s.local_addr().ok()?.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            }
+        })
+        .unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
 fn make_server_config() -> Result<ServerConfig> {
@@ -138,7 +179,63 @@ impl Transport for QuicTransport {
         let server_config = make_server_config()?;
         let endpoint =
             Endpoint::server(server_config, self.listen_addr).map_err(PathweaveError::Io)?;
+        let local_addr = endpoint.local_addr().map_err(PathweaveError::Io)?;
         *self.endpoint.lock().await = Some(endpoint);
+
+        let daemon = ServiceDaemon::new().map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        let host_name = format!("{}.local.", self.instance_name);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &self.instance_name,
+            &host_name,
+            IpAddr::V4(local_ipv4()),
+            local_addr.port(),
+            None,
+        )
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        let service_fullname = info.get_fullname().to_string();
+
+        daemon
+            .register(info)
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        let browse_rx = daemon
+            .browse(SERVICE_TYPE)
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        // Bridge: drains flume ServiceEvents into a tokio mpsc channel so that
+        // discover() can return a BoxStream<'static, PeerAnnouncement> without
+        // borrowing from self.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerAnnouncement>();
+        let bridge = tokio::spawn(async move {
+            while let Ok(event) = browse_rx.recv_async().await {
+                if let ServiceEvent::ServiceResolved(info) = event {
+                    let port = info.get_port();
+                    for ip in info.get_addresses_v4() {
+                        let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+                        if tx
+                            .send(PeerAnnouncement {
+                                address: PeerAddress::Quic(addr),
+                                short_id: None,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        *self.mdns.lock().unwrap() = Some(MdnsState {
+            daemon,
+            service_fullname,
+            announce_rx: Some(rx),
+            bridge,
+        });
+
         Ok(())
     }
 
@@ -146,11 +243,29 @@ impl Transport for QuicTransport {
         if let Some(ep) = self.endpoint.lock().await.take() {
             ep.close(0u32.into(), b"shutdown");
         }
+        if let Some(state) = self.mdns.lock().unwrap().take() {
+            let _ = state.daemon.unregister(&state.service_fullname);
+            let _ = state.daemon.stop_browse(SERVICE_TYPE);
+            state.bridge.abort();
+            let _ = state.daemon.shutdown();
+        }
         Ok(())
     }
 
-    fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
-        Box::pin(futures::stream::empty())
+    fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
+        let rx = self
+            .mdns
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|state| state.announce_rx.take());
+
+        match rx {
+            Some(rx) => Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|ann| (ann, rx))
+            })),
+            None => Box::pin(futures::stream::empty()),
+        }
     }
 
     async fn connect(&self, peer: &PeerAnnouncement) -> Result<Box<dyn Connection>> {

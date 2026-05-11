@@ -54,5 +54,8 @@ bp7 = { version = "0.10", default-features = false }
 # entropy
 getrandom = "0.2"
 
+# discovery
+mdns-sd = "0.11"
+
 # testing
 proptest = "1"

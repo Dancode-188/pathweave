@@ -218,7 +218,7 @@ pub trait MessageHandler: Send + Sync {
 pub trait Transport: Send + Sync {
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
-    fn discover(&self) -> BoxStream<'_, PeerAnnouncement>;
+    fn discover(&self) -> BoxStream<'static, PeerAnnouncement>;
     async fn connect(&self, peer: &PeerAnnouncement) -> Result<Box<dyn Connection>>;
     async fn accept(&self) -> Result<Box<dyn Connection>>;
     fn mtu_hint(&self) -> usize;

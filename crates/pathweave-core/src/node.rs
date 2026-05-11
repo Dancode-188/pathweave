@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::{
-    BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError,
+    BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError, PeerAddress,
     PeerAnnouncement, PeerId, Result, Router, Session, Transport, TransportEvent,
 };
 
@@ -66,15 +67,19 @@ impl DeduplicationCache {
 /// Callers create a node, register transports, inject any known peer addresses, and
 /// then use the four documented API surfaces (send, on_message, events, new).
 ///
-/// The peer table maps PeerId -> PeerAnnouncement. send() looks up the announcement
-/// here; if the peer is not present, NoTransportAvailable is returned immediately.
-/// Use add_peer() to inject a known address (e.g. a QUIC address from the command
-/// line) or wait for a future connect() implementation that dials and learns the
-/// remote PeerId via the Noise_XX handshake.
+/// The peer table maps PeerId -> PeerAnnouncement. The discover task (one per
+/// transport) populates it automatically via mDNS. add_peer() and connect() also
+/// insert into the table for manually-supplied addresses.
 pub struct PathweaveNode {
     router: Router,
     identity: NodeIdentity,
-    peers: HashMap<PeerId, PeerAnnouncement>,
+    peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
+    // Dedup-only: tracks addresses currently in-flight or already connected.
+    // Not authoritative for routing — peers is. peer_stream only upserts to
+    // peers; it never removes. This invariant is what makes the concurrent
+    // add_peer() edge case benign: even if known_addrs loses an entry, the
+    // peers entry remains intact and send() continues to work.
+    known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
 }
@@ -86,14 +91,16 @@ impl PathweaveNode {
         Ok(Self {
             router: Router::new(),
             identity,
-            peers: HashMap::new(),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            known_addrs: Arc::new(Mutex::new(HashSet::new())),
             handler: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
         })
     }
 
     /// Registers a transport, starts its background availability monitor, and
-    /// spawns an accept loop that delivers incoming connections to the message handler.
+    /// spawns an accept loop that delivers incoming connections to the message
+    /// handler and a discover loop that populates the peer table via mDNS.
     ///
     /// Not part of the UniFFI boundary; Rust callers use this during setup.
     /// Must be called before any send() calls that depend on this transport.
@@ -103,7 +110,23 @@ impl PathweaveNode {
         let handler = Arc::clone(&self.handler);
         let dedup = Arc::clone(&self.dedup);
         let started = self.router.register_transport(Arc::clone(&arc));
-        tokio::spawn(accept_loop(arc, identity, handler, dedup, started));
+
+        tokio::spawn(accept_loop(
+            Arc::clone(&arc),
+            identity.clone(),
+            handler,
+            dedup,
+            started.clone(),
+        ));
+
+        tokio::spawn(crate::router::peer_stream(
+            arc,
+            identity,
+            started,
+            Arc::clone(&self.peers),
+            Arc::clone(&self.known_addrs),
+            self.identity.peer_id().clone(),
+        ));
     }
 
     /// Dials `announcement`, completes the Noise_XX handshake as the initiator, stores
@@ -115,7 +138,13 @@ impl PathweaveNode {
     /// Returns NoTransportAvailable if no registered transport is available or all fail.
     pub async fn connect(&mut self, announcement: PeerAnnouncement) -> Result<PeerId> {
         let peer_id = self.router.connect(&announcement, &self.identity).await?;
-        self.peers.insert(peer_id.clone(), announcement);
+        if let PeerAddress::Quic(addr) = &announcement.address {
+            self.known_addrs.lock().unwrap().insert(*addr);
+        }
+        self.peers
+            .lock()
+            .unwrap()
+            .insert(peer_id.clone(), announcement);
         Ok(peer_id)
     }
 
@@ -124,7 +153,10 @@ impl PathweaveNode {
     /// Not part of the UniFFI boundary. Used by pw-chat to inject a QUIC peer
     /// address resolved from the command line, and by tests to set up known peers.
     pub fn add_peer(&mut self, peer_id: PeerId, announcement: PeerAnnouncement) {
-        self.peers.insert(peer_id, announcement);
+        if let PeerAddress::Quic(addr) = &announcement.address {
+            self.known_addrs.lock().unwrap().insert(*addr);
+        }
+        self.peers.lock().unwrap().insert(peer_id, announcement);
     }
 
     /// Sends `payload` to the peer identified by `peer_id`.
@@ -138,10 +170,13 @@ impl PathweaveNode {
     pub async fn send(&self, peer_id: PeerId, payload: Vec<u8>) -> Result<()> {
         let announcement = self
             .peers
+            .lock()
+            .unwrap()
             .get(&peer_id)
+            .cloned()
             .ok_or(PathweaveError::NoTransportAvailable)?;
         self.router
-            .send(announcement, &self.identity, payload)
+            .send(&announcement, &self.identity, payload)
             .await
     }
 
@@ -169,9 +204,9 @@ async fn accept_loop(
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
-    started: Arc<Notify>,
+    mut started: watch::Receiver<bool>,
 ) {
-    started.notified().await;
+    let _ = started.wait_for(|v| *v).await;
     loop {
         match transport.accept().await {
             Ok(conn) => {
@@ -309,7 +344,7 @@ mod tests {
             Ok(())
         }
 
-        fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
             Box::pin(stream::empty())
         }
 
@@ -377,7 +412,7 @@ mod tests {
             Ok(())
         }
 
-        fn discover(&self) -> BoxStream<'_, PeerAnnouncement> {
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
             Box::pin(stream::empty())
         }
 
@@ -589,7 +624,7 @@ mod tests {
         let peer_id = node.connect(dummy_peer()).await.unwrap();
         assert_eq!(peer_id, expected_peer_id);
         // Verify the mapping was stored so send() can now route to this peer.
-        assert!(node.peers.contains_key(&peer_id));
+        assert!(node.peers.lock().unwrap().contains_key(&peer_id));
     }
 
     #[tokio::test]

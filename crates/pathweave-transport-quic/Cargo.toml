@@ -17,6 +17,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
+mdns-sd = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
