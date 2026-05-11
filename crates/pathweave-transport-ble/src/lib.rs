@@ -35,7 +35,6 @@ const ADVERTISEMENT_VERSION: u8 = 0x01;
 struct BlePeripheralState {
     _adv_handle: bluer::adv::AdvertisementHandle,
     _app_handle: bluer::gatt::local::ApplicationHandle,
-    conn_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -91,7 +90,7 @@ async fn peripheral_loop(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    let mut writer: Option<bluer::gatt::local::CharacteristicWriter> = None;
+    let mut writer = None;
     let mut active_write_tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>> = None;
 
     loop {
@@ -153,6 +152,8 @@ pub struct BleTransport {
     adapter: Arc<Mutex<Option<Adapter>>>,
     #[cfg(target_os = "linux")]
     peripheral: Arc<Mutex<Option<BlePeripheralState>>>,
+    #[cfg(target_os = "linux")]
+    conn_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 }
 
 impl BleTransport {
@@ -161,6 +162,8 @@ impl BleTransport {
             adapter: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "linux")]
             peripheral: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "linux")]
+            conn_rx: Mutex::new(None),
         }
     }
 }
@@ -212,8 +215,11 @@ impl Transport for BleTransport {
             // which unregisters the advertisement and GATT application via bluer's
             // RAII guards. This also closes peripheral_loop's control streams,
             // causing it to exit and drop conn_tx, which unblocks any waiting
-            // accept() call (recv() returns None).
+            // accept() call (recv() returns None and releases the conn_rx lock).
             *self.peripheral.lock().await = None;
+            // Clear conn_rx after peripheral is dropped so subsequent accept() calls
+            // return "transport not started" rather than "peripheral loop ended".
+            *self.conn_rx.lock().await = None;
         }
 
         Ok(())
@@ -373,23 +379,19 @@ impl Transport for BleTransport {
 
     #[cfg(target_os = "linux")]
     async fn accept(&self) -> Result<Box<dyn Connection>> {
-        // Clone the Arc to conn_rx inside the lock, then release the outer lock before
-        // awaiting recv(). This prevents a deadlock with stop(): if accept() held the
-        // outer lock across recv(), stop() could not acquire it to drop BlePeripheralState
-        // and unblock the recv() (see ADR 014 rationale).
-        let rx = {
-            let guard = self.peripheral.lock().await;
-            let state = guard
-                .as_ref()
-                .ok_or_else(|| PathweaveError::Transport("transport not started".into()))?;
-            Arc::clone(&state.conn_rx)
-        };
-        rx.lock()
-            .await
-            .recv()
-            .await
-            .map(|c| Box::new(c) as Box<dyn Connection>)
-            .ok_or_else(|| PathweaveError::Transport("peripheral loop ended".into()))
+        // Borrow conn_rx from self (lifetime 'life0: 'async_trait). Holding the guard
+        // across recv() is safe: stop() drops BlePeripheralState first (which closes
+        // conn_tx via peripheral_loop exit), causing recv() to return None and accept()
+        // to release the guard. stop() then acquires the lock to clear it.
+        let mut guard = self.conn_rx.lock().await;
+        match guard.as_mut() {
+            Some(rx) => rx
+                .recv()
+                .await
+                .map(|c| Box::new(c) as Box<dyn Connection>)
+                .ok_or_else(|| PathweaveError::Transport("peripheral loop ended".into())),
+            None => Err(PathweaveError::Transport("transport not started".into())),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -494,10 +496,10 @@ impl BleTransport {
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(peripheral_loop(write_ctrl, notify_ctrl, conn_tx));
 
+        *self.conn_rx.lock().await = Some(conn_rx);
         *self.peripheral.lock().await = Some(BlePeripheralState {
             _adv_handle: adv_handle,
             _app_handle: app_handle,
-            conn_rx: Arc::new(Mutex::new(conn_rx)),
         });
 
         Ok(())
