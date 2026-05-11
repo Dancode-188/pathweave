@@ -109,7 +109,9 @@ impl PathweaveNode {
         let identity = self.identity.clone();
         let handler = Arc::clone(&self.handler);
         let dedup = Arc::clone(&self.dedup);
-        let started = self.router.register_transport(Arc::clone(&arc));
+        let started = self
+            .router
+            .register_transport(Arc::clone(&arc), Arc::new(self.identity.clone()));
 
         tokio::spawn(accept_loop(
             Arc::clone(&arc),
@@ -336,7 +338,7 @@ mod tests {
 
     #[async_trait]
     impl crate::Transport for MockTransport {
-        async fn start(&self) -> Result<()> {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
             Ok(())
         }
 
@@ -404,7 +406,7 @@ mod tests {
 
     #[async_trait]
     impl crate::Transport for AcceptMockTransport {
-        async fn start(&self) -> Result<()> {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
             Ok(())
         }
 

@@ -18,5 +18,8 @@ tracing = { workspace = true }
 btleplug = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
