@@ -36,7 +36,7 @@ Transport trait        // the abstraction boundary. dumb byte pipes with metadat
   QUIC  BLE            // separate crates. no knowledge of crypto or peer identity.
 ```
 
-Transports are dumb. They move bytes. Everything else -- crypto, routing, bundling --
+Transports are dumb. They move bytes. Everything else (crypto, routing, bundling)
 lives in `pathweave-core`. Adding a new transport (WiFi Direct, SMS, USSD) means
 implementing one trait. It doesn't touch anything else.
 
@@ -59,8 +59,8 @@ the previous.
 
 ## The public API
 
-The public API has six surfaces: four exposed through UniFFI to Swift and Kotlin,
-two Rust-only setup methods that are not part of the FFI boundary.
+The public API has seven surfaces: four exposed through UniFFI to Swift and Kotlin,
+three Rust-only methods that are not part of the FFI boundary.
 
 **UniFFI-facing (four):**
 
@@ -78,21 +78,23 @@ node.on_message(handler); // handler implements MessageHandler (see below)
 let mut events = node.events(); // Stream<Item = TransportEvent>
 ```
 
-**Rust-only setup (two, not in the UDL):**
+**Rust-only (three, not in the UDL):**
 
 ```rust
 // register a transport before first use
 node.register_transport(Box::new(quic));
 
+// dial a peer, complete the Noise_XX handshake, store the PeerId -> address mapping
+// the session closes immediately after the handshake; send() re-dials on each call
+node.connect(announcement).await?;
+
 // inject a known peer address (e.g. QUIC --peer <address> from the command line)
-// the PeerId -> PeerAnnouncement mapping is populated here so send() can route to it
 node.add_peer(peer_id, announcement);
 ```
 
-`connect(announcement: PeerAnnouncement) -> Result<PeerId>` dials the peer, completes
-the Noise_XX handshake as the initiator, stores `(PeerId, PeerAnnouncement)` in the
-peer table, and returns the PeerId. The session is closed immediately after the handshake;
-`send()` re-dials on each call (lazy connections). Tries transports in cost order.
+`connect()` tries transports in cost order (Free first). It returns the PeerId learned
+from the Noise_XX handshake. Subsequent `send()` calls look up the stored address and
+re-dial lazily.
 
 **MessageHandler** is a callback interface, not a closure. This is a UniFFI requirement --
 closures don't cross FFI boundaries cleanly. In Rust, you implement the trait. In Swift,
@@ -172,9 +174,9 @@ I, l). Safe to read aloud, type by hand, or put in a QR code.
 ```rust
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn start(&self) -> Result<()>;
+    async fn start(&self, identity: &NodeIdentity) -> Result<()>;
     async fn stop(&self) -> Result<()>;
-    fn discover(&self) -> BoxStream<'_, PeerAnnouncement>;
+    fn discover(&self) -> BoxStream<'static, PeerAnnouncement>;
     async fn connect(&self, peer: &PeerAnnouncement) -> Result<Box<dyn Connection>>;
     async fn accept(&self) -> Result<Box<dyn Connection>>;
     fn mtu_hint(&self) -> usize;
@@ -191,6 +193,16 @@ pub trait Connection: Send + Sync {
     fn mtu(&self) -> usize;
 }
 ```
+
+`start()` receives the node's identity so transports that advertise (BLE peripheral) can
+derive the `short_id` from `identity.peer_id()` without knowing anything about PeerId
+derivation themselves. See ADR 010.
+
+`discover()` returns `BoxStream<'static, ...>` not `BoxStream<'_, ...>`. The stream must
+outlive the `&self` borrow because the Router drives it from a spawned background task
+after the `register_transport()` call returns. The stream owns all the state it needs
+(the mDNS channel receiver, the btleplug adapter clone) so no lifetime tie to `self` is
+required.
 
 `PeerAnnouncement` carries a transport-level address: a BLE MAC address or a QUIC socket
 address. It is not a PeerId. The Noise handshake happens above this in the Session layer.
@@ -220,56 +232,64 @@ pub enum TransportCost {
 }
 ```
 
-Simple for v0.1.0. Gets richer in v0.2.0: WiFi vs mobile data detection for QUIC
-replaces the blanket Metered default. Battery level, signal quality, and payload-size
-routing are deferred beyond v0.2.0.
-
 `Metered` covers two situations that are not the same: QUIC over WiFi (flat monthly fee,
 functionally free) and QUIC over mobile data (per-megabyte, genuinely metered). Detecting
-which one you're on requires platform-specific OS APIs. v0.1.0 reports `Metered` for all
-QUIC connections as the conservative default. The v0.2.0 cost intelligence work starts
-here.
+which one you're on requires platform-specific OS APIs. Currently, all QUIC connections
+report `Metered` as the conservative default. The v0.2.0 cost intelligence work will
+replace this with WiFi vs. mobile data detection. Battery level, signal quality, and
+payload-size routing are deferred beyond v0.2.0.
 
 ---
 
-## The routing layer (v0.1.0)
+## The routing layer
 
 Static priority fallback. That's what it is and what we call it.
 
 1. If BLE is available and the peer is reachable over BLE, use BLE.
 2. Otherwise, use QUIC.
 
-The routing gets real cost intelligence in v0.2.0. For now, free transport wins.
+The routing gets real cost intelligence later in v0.2.0. For now, free transport wins.
 
-**How the switch works: startup detection, lazy connections**
+**How the switch works: health monitoring, lazy connections**
 
-The router runs a background task for each registered transport. The task calls `start()`
-and marks the transport available if it succeeds. In v0.1.0, that is the only availability
-check: transport state is set once at startup and never updated by the monitor.
+The router runs a `health_monitor` background task for each registered transport. On
+startup, the task calls `start(&identity)` and marks the transport available if it
+succeeds. It then polls the non-loopback IPv4 address set every 3 seconds
+(`NETWORK_POLL_INTERVAL`). When the address set changes (a network interface came up or
+went away), it calls `stop()` and restarts the transport with `start()`, updating the
+`AtomicBool` availability flag accordingly.
+
+If `start()` fails, the monitor enters recovery mode: it retries `start()` unconditionally
+on every tick instead of comparing address sets. This handles the case where an interface
+stays down: the address set would never change, so a pure change-detection loop would
+never retry. See ADR 013.
 
 Connections are lazy. The router doesn't maintain active connections to every peer on
-every transport simultaneously. It maintains transport state (available/unavailable) and
-opens a connection on the best available transport when `send()` is called.
+every transport simultaneously. It maintains transport availability state and opens a
+connection on the best available transport when `send()` is called.
 
-When a transport that was available at startup becomes unavailable (network goes down, BLE
-goes out of range), the router does not detect this proactively. The next `send()` attempt
-on that transport fails, and the router falls back to the next available transport. At most
-one message experiences this latency during a failover.
+**Retry behavior**
 
-Proactive health monitoring (keepalives, OS network events, continuous BLE scanning) is a
-v0.2.0 addition.
+`send()` retries up to `MAX_SEND_ATTEMPTS` (3) times across available transports, with
+a 1-second back-off (`RETRY_BACKOFF`) between attempts. Each attempt dials the peer,
+completes the Noise_XX handshake, sends the framed payload, and waits for the delivery
+ACK. If all attempts fail, `send()` returns `PathweaveError::DeliveryFailed`. See the
+delivery guarantees section.
 
 ---
 
 ## Incoming message delivery (the accept loop)
 
-`register_transport()` on `PathweaveNode` does two things: hands the transport to the
-Router for outbound use, and spawns an accept loop task that runs for the lifetime of
-the node.
+`register_transport()` on `PathweaveNode` does three things: registers the transport
+with the Router (which starts its `health_monitor` task), spawns an `accept_loop` task
+that delivers incoming connections to the message handler, and spawns a `peer_stream`
+task that drives `discover()` and populates the peer table for outbound routing. All
+three tasks run for the lifetime of the node.
 
 The accept loop:
 
 ```
+wait for health_monitor to signal start() success   // prevents startup race
 loop {
     conn = transport.accept().await
     if error: log, sleep 5 s, retry    // handles transports that don't support inbound
@@ -284,19 +304,34 @@ BundleLayer::new(conn)               // wraps in bundle framing
 Session::respond(identity, bundled)  // Noise_XX handshake as responder
 peer_id = session.peer_id()          // identity revealed after handshake
 loop:
-    payload = session.recv()
-    handler.on_message(peer_id, payload)  // delivered to the registered handler
+    payload = session.recv()         // payload = [message_id: u64 big-endian] ++ [app bytes]
+    if payload.len() < 8:
+        session.send(b"")            // ACK malformed frame so sender doesn't hang
+        continue
+    message_id = payload[0..8]       // extract 8-byte ID prepended by the sender
+    if dedup_cache.check_and_insert(peer_id, message_id):
+        session.send(b"")            // ACK even on duplicate -- stops the sender retrying
+        continue
+    handler.on_message(peer_id, payload[8..])   // deliver app bytes (ID stripped)
     session.send(b"")                // empty ACK to the sender (see note below)
 ```
 
 **Why the ACK is required:** Quinn's `write_all()` writes to an internal send buffer; actual transmission is async. If the sender drops the session immediately after `send()`, Quinn fires `CONNECTION_CLOSE` before flushing the buffer and the data is silently lost. The receiver's empty ACK keeps the sender's connection alive long enough for the data to be transmitted. `send()` returning `Ok(())` is only meaningful when this round-trip completes. See ADR 009 and issue #34.
+
+**Why the message ID exists:** `send()` retries up to 3 times on failure. If the first
+attempt delivers the payload and the ACK is lost in transit, the second attempt carries
+the same message ID. The `DeduplicationCache` at the receiver suppresses the duplicate
+call to `on_message()` but still sends the ACK so the sender stops retrying. Cache
+entries are keyed on `(PeerId, message_id)` and expire after `DEDUP_TTL` (60 seconds).
+Given `MAX_SEND_ATTEMPTS = 3` and `RETRY_BACKOFF = 1s`, the entire retry window is well
+under 60 seconds, so a duplicate will always hit a live cache entry. See ADR 011.
 
 The handler is stored as `Arc<Mutex<Option<Box<dyn MessageHandler>>>>`. The Arc is
 cloned into each accept loop task so a single handler registration covers all
 transports. Locking is brief: the `on_message` call is synchronous and the lock is
 released before the next recv().await.
 
-Transports that don't support inbound connections (BLE central mode in v0.1.0) return
+Transports that don't support inbound connections (BLE central-only mode) return
 an error from `accept()`. The accept loop catches this, logs it at debug level, and
 backs off for 5 seconds before retrying. This means registering a central-only BLE
 transport does not produce a tight busy loop.
@@ -336,9 +371,8 @@ assembly that's harder to reason about and has had maintenance issues. We use Ru
 
 ## The bundle layer
 
-BPv7 (RFC 9171) via the `bp7` crate. Handles message framing, bundle IDs (which lay
-the groundwork for at-least-once delivery later), fragmentation for transports with small
-MTUs, and reassembly on the receiving end.
+BPv7 (RFC 9171) via the `bp7` crate. Handles message framing, bundle IDs, fragmentation
+for transports with small MTUs, and reassembly on the receiving end.
 
 The bundle layer asks the Connection for its actual negotiated `mtu()`, then fragments
 accordingly. The transport never sees a message larger than its MTU. The application
@@ -348,16 +382,18 @@ never sees a fragmented message.
 
 ## QUIC transport -- discovery
 
-QUIC has no automatic peer discovery. `discover()` on the QUIC transport returns an
-empty stream. This is intentional. In pw-chat, the `--peer <address>` argument
-constructs a `PeerAnnouncement` directly from the socket address and calls `connect()`
-without going through discovery at all. When someone reads this in the code later, it's
-not a bug -- it's how QUIC works in Pathweave. mDNS-based automatic discovery is a
-v0.2.0 addition.
+`QuicTransport::discover()` returns a live stream of peers found via mDNS
+(`_pathweave._udp.local.`). `start()` registers the node as an mDNS service on the
+local network and begins browsing for other Pathweave services. Each resolved service
+maps to a `PeerAnnouncement` with a `PeerAddress::Quic` socket address. See ADR 012.
+
+In pw-chat, the `--peer <address>` argument constructs a `PeerAnnouncement` directly
+from the socket address and bypasses discovery entirely. This is intentional: mDNS
+works on local networks where multicast is available; direct addressing works everywhere.
 
 ## QUIC TLS
 
-QUIC requires TLS 1.3 -- it's in the spec (RFC 9000) and there's no way around it. We
+QUIC requires TLS 1.3; it's in the spec (RFC 9000) and there's no way around it. We
 satisfy the requirement with a fresh ephemeral self-signed certificate generated at
 startup and thrown away when the session ends.
 
@@ -391,10 +427,13 @@ Pathweave service UUID:       82dfc0ba-e2b5-4e65-ad11-c7238ca545c9
 Service data:                 [version: u8 = 0x01] ++ [short_id: [u8; 8]]
 ```
 
-`short_id` is the first 8 bytes of the node's PeerId. A scanning node sees: this is a
-Pathweave peer, here are the first 8 bytes of their identity. Enough to decide whether
-to connect, without any handshake overhead. The payload fits in the classic BLE
-advertisement limit of about 31 bytes, which gives us the widest hardware compatibility.
+`short_id` is the first 8 bytes of the node's PeerId. It is included in the
+advertisement so that future contact-aware filtering (v0.3.0, once there is a key
+registry) can skip the Noise handshake for unknown peers. Currently the `peer_stream`
+task connects to every node carrying the Pathweave service UUID regardless of short_id;
+the full PeerId is only known after the Noise_XX handshake completes. The payload
+fits in the classic BLE advertisement limit of about 31 bytes, which gives us the
+widest hardware compatibility.
 
 **Phase 2 -- GATT connection**
 
@@ -423,50 +462,42 @@ Central mode: `btleplug` v0.11, all platforms. Handles scanning and GATT connect
 
 Peripheral mode: platform-specific.
 
-- Linux: `bluer`, a well-maintained async Rust crate that wraps the full BlueZ API
-  including advertising.
+- Linux: `bluer` v0.17, shipped in v0.2.0. A well-maintained async Rust crate that
+  wraps the full BlueZ D-Bus API including advertising. See ADR 014.
 - Android and iOS: the platform's native BLE APIs called through the UniFFI layer.
   CoreBluetooth on iOS, BluetoothManager on Android. The `pathweave-transport-ble`
   Rust crate is not used for peripheral mode on mobile; the native layer handles it.
-- macOS: deferred to v0.2.0. CoreBluetooth is available on macOS (same framework as
-  iOS); the native binding work is not prioritized for v0.1.0 given the primary
-  deployment targets are phones.
-- Windows: deferred to v0.2.0.
+- macOS: not yet implemented. CoreBluetooth is available on macOS (same framework as
+  iOS); the implementation will be compile-tested on CI with community hardware testing.
+  Tracked in issue #52.
+- Windows: not yet implemented. WinRT GATT Server API (Windows.Devices.Bluetooth).
+  Tracked in issue #51.
 
-**macOS and Windows peripheral mode**
+**BLE peripheral and NodeIdentity**
 
-macOS has CoreBluetooth, the same framework used for iOS peripheral mode. The path
-exists. But the native binding work for macOS desktop is separate from the iOS UniFFI
-path, and the primary deployment targets for v0.1.0 are phones. macOS peripheral mode
-is deferred to v0.2.0.
-
-Windows has OS-level BLE GATT Server support (WinRT, since Windows 10 Creators
-Update) but no maintained Rust crate wraps it reliably. Implementing it requires
-writing a WinRT wrapper using the `windows` crate, which involves COM apartment
-threading rules that interact with async Rust runtimes in ways that produce subtle,
-hardware-dependent bugs. The risk and timeline cost are not justified for v0.1.0
-given that the primary deployment targets are phones.
-
-BLE peripheral development for v0.1.0 requires a Linux machine or a phone via the
-native bindings path. A macOS or Windows machine cannot act as the advertising peer
-in v0.1.0.
+`Transport::start(&identity)` passes the node's identity to `BleTransport` so
+`start_peripheral()` can derive `short_id` (first 8 bytes of `identity.peer_id()`)
+for the advertisement payload. The transport never stores the identity beyond `start()`;
+it uses only the derived short_id. See ADR 010.
 
 ---
 
-## Delivery guarantees (v0.1.0)
+## Delivery guarantees
 
-Single-attempt confirmed delivery. `send()` returns `Ok(())` when the receiver has
-acknowledged delivery via the session ACK round-trip. No guarantee of ordering or
-exactly-once semantics. If the connection fails before the ACK arrives, `send()` returns
-an error -- there is no automatic retry. BPv7 bundle IDs are there to support full
-at-least-once delivery with retry later, but v0.1.0 doesn't implement it.
+At-least-once confirmed delivery. `send()` retries up to `MAX_SEND_ATTEMPTS` (3) times
+on transient failures, with a 1-second back-off between attempts. `send()` returns
+`Ok(())` when the receiver has acknowledged delivery via the session ACK round-trip.
 
-This is stronger than "bytes handed to the transport" but weaker than at-least-once.
-The README and docs say this plainly. A developer who knows the constraint can design
-around it.
+Each attempt carries the same 8-byte message ID (generated from OS entropy before the
+first attempt). The receiver's `DeduplicationCache` suppresses duplicate delivery to
+`on_message()` if a retry arrives after a successful first delivery where the ACK was
+lost. The ACK is sent regardless of whether the message is a duplicate, so the sender
+stops retrying. See ADR 011.
 
-When no transport can reach the peer, `send()` returns
-`PathweaveError::NoTransportAvailable` immediately. No silent queuing.
+No guarantee of ordering or exactly-once semantics across sessions. If all `MAX_SEND_ATTEMPTS`
+fail, `send()` returns `PathweaveError::DeliveryFailed`. When no transport can reach the
+peer at all, `send()` returns `PathweaveError::NoTransportAvailable` immediately. No
+silent queuing.
 
 ---
 
@@ -484,7 +515,7 @@ with them, not against them.
 
 ## pw-chat
 
-The v0.1.0 demo. Two people run it. They're talking over QUIC. Internet goes down. The
+The launch demo. Two people run it. They're talking over QUIC. Internet goes down. The
 app switches to BLE automatically. The conversation continues.
 
 ```
@@ -492,30 +523,32 @@ pw-chat --peer 192.168.1.42:9001   // connect to a known QUIC address
 pw-chat                             // listen mode -- accepts BLE and QUIC connections
 ```
 
-QUIC peer discovery is address-based. You know the address. BLE discovery is automatic.
-The transport scans and connects without any configuration. mDNS for automatic QUIC
-discovery is a v0.2.0 addition.
+QUIC peer discovery is address-based for direct connections, or automatic via mDNS on
+local networks. BLE discovery is automatic: the transport scans for the Pathweave service
+UUID and connects without configuration.
 
 When neither transport can reach the peer: "message failed: no transport available."
-No queuing, no silent retry. Known v0.1.0 limitation, documented as one.
+No queuing, no silent retry.
 
-BLE in pw-chat works when at least one peer can advertise. Supported configurations
-for the BLE fallback demo: two Linux machines, or a Linux machine and a phone running
-the native SDK. macOS and Windows machines cannot act as the advertising peer in v0.1.0.
+BLE in pw-chat works when at least one peer can advertise. Supported configurations:
+two Linux machines, a Linux machine and a Windows or macOS machine (pending issues
+#51 and #52), or any of the above and a phone running the native SDK.
 
 ---
 
-## What v0.1.0 doesn't do
+## What this version doesn't do
 
 Being clear about this matters as much as being clear about what it does.
 
 - No WiFi Direct, SMS, or USSD transports
 - No MLS group key exchange (Noise_XX is 1:1 only)
-- No at-least-once delivery
-- No automatic QUIC peer discovery (mDNS)
 - No multi-hop BLE routing (single-hop only)
 - No contact or key registry (Noise_XK upgrade deferred to v0.3.0)
-- No BLE peripheral mode (advertising) on macOS or Windows (deferred to v0.2.0)
+- No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
+  NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
+- No WiFi vs. mobile data detection for QUIC cost reporting (v0.2.0 cost intelligence
+  work not yet complete; all QUIC connections currently report Metered)
+- No BLE peripheral mode on macOS or Windows yet (in progress, issues #51 and #52)
 - No security audit completed
 
 v1.0.0 means the API is stable and the library is ready for production use. We're
