@@ -20,6 +20,7 @@ bs58 = { workspace = true }
 x25519-dalek = { workspace = true }
 bp7 = { workspace = true }
 getrandom = { workspace = true }
+if-addrs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
