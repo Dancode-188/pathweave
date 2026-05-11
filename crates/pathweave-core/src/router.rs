@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use crate::{
 
 const MAX_SEND_ATTEMPTS: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 struct TransportEntry {
     transport: Arc<dyn Transport>,
@@ -54,7 +55,7 @@ impl Router {
 
         let t = Arc::clone(&transport);
         let a = Arc::clone(&available);
-        let task = tokio::spawn(monitor(t, a, started_tx));
+        let task = tokio::spawn(health_monitor(t, started_tx, a));
 
         self.transports.push(TransportEntry {
             transport,
@@ -184,20 +185,77 @@ impl Drop for Router {
     }
 }
 
-/// Monitors a single transport. Marks it available after start() succeeds,
-/// signals `started` so waiting tasks can begin, then parks until the router
-/// is dropped. Using a watch::Sender means any task that subscribes late still
-/// sees the `true` value without a race.
-async fn monitor(
+/// Manages the full lifecycle of a single transport: initial start, periodic
+/// interface polling, and restart on address change.
+///
+/// Operates in one of two modes. Normal mode: polls the non-loopback IPv4
+/// address set every NETWORK_POLL_INTERVAL; restarts the transport when the
+/// set changes. Recovery mode: entered when start() fails; retries start()
+/// unconditionally on every tick without comparing address sets. This handles
+/// the case where the interface stays down: empty == empty would never trigger
+/// a restart in normal mode, so an unconditional retry path is required.
+///
+/// Sets available and sends on the started watch channel to signal consumers
+/// (accept_loop, peer_stream) on each transition.
+pub(crate) async fn health_monitor(
     transport: Arc<dyn Transport>,
-    available: Arc<AtomicBool>,
     started: watch::Sender<bool>,
+    available: Arc<AtomicBool>,
 ) {
-    if transport.start().await.is_ok() {
+    let mut prev_addrs = current_ipv4_addrs();
+    let mut in_recovery = if transport.start().await.is_ok() {
         available.store(true, Ordering::Release);
         let _ = started.send(true);
-        std::future::pending::<()>().await;
+        false
+    } else {
+        tracing::warn!(
+            transport = transport.name(),
+            "initial start failed; entering recovery mode"
+        );
+        true
+    };
+
+    loop {
+        tokio::time::sleep(NETWORK_POLL_INTERVAL).await;
+        let curr_addrs = current_ipv4_addrs();
+
+        if !in_recovery && curr_addrs == prev_addrs {
+            continue;
+        }
+
+        available.store(false, Ordering::Release);
+        let _ = started.send(false);
+        let _ = transport.stop().await;
+
+        if transport.start().await.is_ok() {
+            available.store(true, Ordering::Release);
+            let _ = started.send(true);
+            prev_addrs = curr_addrs;
+            in_recovery = false;
+            tracing::info!(
+                transport = transport.name(),
+                "transport restarted after address change"
+            );
+        } else {
+            tracing::warn!(
+                transport = transport.name(),
+                "transport restart failed; will retry"
+            );
+            in_recovery = true;
+        }
     }
+}
+
+fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) => Some(v4.ip),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
@@ -252,7 +310,7 @@ async fn try_send(
     }
 }
 
-/// Drives mDNS peer discovery for a single transport.
+/// Drives mDNS peer discovery for a single transport across restarts.
 ///
 /// Waits for the transport to start, then drains its discover() stream. For
 /// each announced address that is not already in `known_addrs`, performs a
@@ -261,9 +319,10 @@ async fn try_send(
 /// removes the address from `known_addrs` so the next re-announcement retries.
 /// Skips self-announcements by comparing the remote PeerId with `local_peer_id`.
 ///
-/// Address-based dedup (not PeerId-based) handles peer roaming: if a known
-/// peer reappears at a new address, the new address is not in `known_addrs`
-/// and a fresh handshake is performed, updating the peer table entry.
+/// When the discover stream ends (transport stopped by health_monitor), loops
+/// back and waits for the next started -> stopped -> started cycle. The
+/// wait_for(false) step prevents a spin loop on transports whose discover()
+/// returns an empty stream immediately.
 pub(crate) async fn peer_stream(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
@@ -272,34 +331,39 @@ pub(crate) async fn peer_stream(
     known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     local_peer_id: PeerId,
 ) {
-    let _ = started.wait_for(|v| *v).await;
-    let mut discover = transport.discover();
-    while let Some(announcement) = discover.next().await {
-        let addr = match &announcement.address {
-            PeerAddress::Quic(addr) => *addr,
-            _ => continue,
-        };
+    loop {
+        let _ = started.wait_for(|v| *v).await;
+        let mut discover = transport.discover();
+        while let Some(announcement) = discover.next().await {
+            let addr = match &announcement.address {
+                PeerAddress::Quic(addr) => *addr,
+                _ => continue,
+            };
 
-        // Skip re-announcements from already-connected addresses (O(1) check).
-        if !known_addrs.lock().unwrap().insert(addr) {
-            continue;
-        }
+            // Skip re-announcements from already-connected addresses (O(1) check).
+            if !known_addrs.lock().unwrap().insert(addr) {
+                continue;
+            }
 
-        match try_connect(transport.as_ref(), &announcement, &identity).await {
-            Ok(peer_id) if peer_id == local_peer_id => {
-                // Self-discovery: keep addr in known_addrs so we don't retry.
-                tracing::debug!(addr = %addr, "mDNS: discovered self; skipping");
-            }
-            Ok(peer_id) => {
-                tracing::debug!(addr = %addr, peer = %peer_id, "mDNS: peer connected");
-                peers.lock().unwrap().insert(peer_id, announcement);
-            }
-            Err(e) => {
-                tracing::debug!(addr = %addr, "mDNS: handshake failed: {}", e);
-                // Remove so we retry on the next re-announcement.
-                known_addrs.lock().unwrap().remove(&addr);
+            match try_connect(transport.as_ref(), &announcement, &identity).await {
+                Ok(peer_id) if peer_id == local_peer_id => {
+                    // Self-discovery: keep addr in known_addrs so we don't retry.
+                    tracing::debug!(addr = %addr, "mDNS: discovered self; skipping");
+                }
+                Ok(peer_id) => {
+                    tracing::debug!(addr = %addr, peer = %peer_id, "mDNS: peer connected");
+                    peers.lock().unwrap().insert(peer_id, announcement);
+                }
+                Err(e) => {
+                    tracing::debug!(addr = %addr, "mDNS: handshake failed: {}", e);
+                    // Remove so we retry on the next re-announcement.
+                    known_addrs.lock().unwrap().remove(&addr);
+                }
             }
         }
+        // Stream ended (transport stopped). Wait for the stopped signal before
+        // looping so we don't spin if discover() returns an empty stream.
+        let _ = started.wait_for(|v| !v).await;
     }
 }
 
@@ -695,5 +759,248 @@ mod tests {
         let identity = NodeIdentity::generate();
         let result = router.connect(&dummy_peer(), &identity).await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
+    }
+
+    // --- health_monitor tests -------------------------------------------------
+
+    struct StartFailNTimes {
+        remaining_failures: Arc<AtomicUsize>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for StartFailNTimes {
+        async fn start(&self) -> Result<()> {
+            let n =
+                self.remaining_failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        if n > 0 {
+                            Some(n - 1)
+                        } else {
+                            None
+                        }
+                    });
+            if n.is_ok() {
+                Err(PathweaveError::Transport("start: injected failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn stop(&self) -> Result<()> {
+            self.stop_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
+            Box::pin(stream::empty())
+        }
+        async fn connect(&self, _: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
+            Err(PathweaveError::Transport("not used".into()))
+        }
+        async fn accept(&self) -> Result<Box<dyn Connection>> {
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+        fn mtu_hint(&self) -> usize {
+            65535
+        }
+        fn cost(&self) -> TransportCost {
+            TransportCost::Free
+        }
+        fn kind(&self) -> TransportKind {
+            TransportKind::Ble
+        }
+        fn name(&self) -> &'static str {
+            "start-fail-n-times"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_monitor_initial_success_sets_available() {
+        let (t, _, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
+        let available = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = watch::channel(false);
+
+        tokio::spawn(health_monitor(t, started_tx, Arc::clone(&available)));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(available.load(Ordering::Acquire));
+        assert!(*started_rx.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_monitor_enters_recovery_and_retries_on_next_tick() {
+        let failures = Arc::new(AtomicUsize::new(1));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(StartFailNTimes {
+            remaining_failures: Arc::clone(&failures),
+            stop_count: Arc::clone(&stop_count),
+        });
+        let available = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = watch::channel(false);
+
+        tokio::spawn(health_monitor(
+            transport,
+            started_tx,
+            Arc::clone(&available),
+        ));
+
+        // Yield so the initial start() runs and fails.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !available.load(Ordering::Acquire),
+            "should be unavailable after failed start"
+        );
+        assert!(!*started_rx.borrow());
+
+        // Advance one poll interval: recovery mode retries start() unconditionally.
+        tokio::time::advance(NETWORK_POLL_INTERVAL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            available.load(Ordering::Acquire),
+            "should be available after recovery retry"
+        );
+        assert!(*started_rx.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_monitor_recovery_does_not_require_address_change() {
+        // Transport fails twice, then succeeds. Verifies that recovery mode retries
+        // on every tick without needing the address set to change between ticks.
+        let failures = Arc::new(AtomicUsize::new(2));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(StartFailNTimes {
+            remaining_failures: Arc::clone(&failures),
+            stop_count: Arc::clone(&stop_count),
+        });
+        let available = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = watch::channel(false);
+
+        tokio::spawn(health_monitor(
+            transport,
+            started_tx,
+            Arc::clone(&available),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!available.load(Ordering::Acquire));
+
+        // First tick: recovery retry fails again (second failure).
+        tokio::time::advance(NETWORK_POLL_INTERVAL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !available.load(Ordering::Acquire),
+            "still in recovery after second failure"
+        );
+
+        // Second tick: recovery retry succeeds (no third failure).
+        tokio::time::advance(NETWORK_POLL_INTERVAL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            available.load(Ordering::Acquire),
+            "recovered on second retry"
+        );
+        assert!(*started_rx.borrow());
+    }
+
+    // --- peer_stream tests ----------------------------------------------------
+
+    struct ControllableDiscoverTransport {
+        // Each pop_front dequeues the next discover() stream in call order.
+        streams: std::sync::Mutex<std::collections::VecDeque<BoxStream<'static, PeerAnnouncement>>>,
+        discover_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for ControllableDiscoverTransport {
+        async fn start(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
+            self.discover_calls.fetch_add(1, Ordering::Relaxed);
+            self.streams
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Box::pin(stream::empty()))
+        }
+        async fn connect(&self, _: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
+            Err(PathweaveError::Transport("not used".into()))
+        }
+        async fn accept(&self) -> Result<Box<dyn Connection>> {
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+        fn mtu_hint(&self) -> usize {
+            65535
+        }
+        fn cost(&self) -> TransportCost {
+            TransportCost::Free
+        }
+        fn kind(&self) -> TransportKind {
+            TransportKind::Quic
+        }
+        fn name(&self) -> &'static str {
+            "controllable-discover"
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stream_calls_discover_again_after_restart() {
+        // Two streams: both empty. Verify discover() is called twice after a
+        // stopped -> started cycle.
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(ControllableDiscoverTransport {
+            streams: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Box::pin(stream::empty()) as BoxStream<'static, PeerAnnouncement>,
+                Box::pin(stream::empty()) as BoxStream<'static, PeerAnnouncement>,
+            ])),
+            discover_calls: Arc::clone(&discover_calls),
+        });
+        let (started_tx, started_rx) = watch::channel(false);
+        let peers = Arc::new(Mutex::new(HashMap::new()));
+        let known_addrs = Arc::new(Mutex::new(HashSet::new()));
+        let local_peer_id = NodeIdentity::generate().peer_id().clone();
+
+        tokio::spawn(peer_stream(
+            transport,
+            NodeIdentity::generate(),
+            started_rx,
+            Arc::clone(&peers),
+            Arc::clone(&known_addrs),
+            local_peer_id,
+        ));
+
+        // Start the transport: peer_stream calls discover() (first call, empty stream ends).
+        let _ = started_tx.send(true);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // peer_stream is now in wait_for(false). Send false to let it proceed.
+        let _ = started_tx.send(false);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Send true again: peer_stream calls discover() a second time.
+        let _ = started_tx.send(true);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            discover_calls.load(Ordering::Relaxed),
+            2,
+            "discover() must be called again after a restart cycle"
+        );
     }
 }
