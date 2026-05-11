@@ -175,7 +175,7 @@ impl ServerCertVerifier for SkipServerVerification {
 
 #[async_trait]
 impl Transport for QuicTransport {
-    async fn start(&self) -> Result<()> {
+    async fn start(&self, _identity: &pathweave_core::NodeIdentity) -> Result<()> {
         let server_config = make_server_config()?;
         let endpoint =
             Endpoint::server(server_config, self.listen_addr).map_err(PathweaveError::Io)?;
@@ -416,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn full_stack_roundtrip() {
         let server = Arc::new(QuicTransport::new(loopback(0)));
-        server.start().await.unwrap();
+        server.start(&NodeIdentity::generate()).await.unwrap();
         let server_addr = server.local_addr().await.unwrap();
 
         let server_identity = NodeIdentity::generate();

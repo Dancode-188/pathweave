@@ -49,13 +49,17 @@ impl Router {
     /// the discover loop) should `wait_for(|v| *v).await` on a clone of the
     /// returned receiver. Unlike `Notify`, a watch receiver that arrives late
     /// still sees `true` because the value is retained.
-    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) -> watch::Receiver<bool> {
+    pub fn register_transport(
+        &mut self,
+        transport: Arc<dyn Transport>,
+        identity: Arc<NodeIdentity>,
+    ) -> watch::Receiver<bool> {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
         let t = Arc::clone(&transport);
         let a = Arc::clone(&available);
-        let task = tokio::spawn(health_monitor(t, started_tx, a));
+        let task = tokio::spawn(health_monitor(t, started_tx, a, identity));
 
         self.transports.push(TransportEntry {
             transport,
@@ -201,9 +205,10 @@ pub(crate) async fn health_monitor(
     transport: Arc<dyn Transport>,
     started: watch::Sender<bool>,
     available: Arc<AtomicBool>,
+    identity: Arc<NodeIdentity>,
 ) {
     let mut prev_addrs = current_ipv4_addrs();
-    let mut in_recovery = if transport.start().await.is_ok() {
+    let mut in_recovery = if transport.start(&identity).await.is_ok() {
         available.store(true, Ordering::Release);
         let _ = started.send(true);
         false
@@ -227,7 +232,7 @@ pub(crate) async fn health_monitor(
         let _ = started.send(false);
         let _ = transport.stop().await;
 
-        if transport.start().await.is_ok() {
+        if transport.start(&identity).await.is_ok() {
             available.store(true, Ordering::Release);
             let _ = started.send(true);
             prev_addrs = curr_addrs;
@@ -426,7 +431,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for MockTransport {
-        async fn start(&self) -> Result<()> {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
             Ok(())
         }
 
@@ -561,9 +566,10 @@ mod tests {
         let (quic, _quic_rx, quic_count) =
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(ble);
-        router.register_transport(quic);
+        router.register_transport(ble, Arc::clone(&identity));
+        router.register_transport(quic, Arc::clone(&identity));
 
         // Yield so monitoring tasks run start() and set available = true.
         tokio::task::yield_now().await;
@@ -597,9 +603,10 @@ mod tests {
         let (quic, mut quic_rx, quic_count) =
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(ble);
-        router.register_transport(quic);
+        router.register_transport(ble, Arc::clone(&identity));
+        router.register_transport(quic, Arc::clone(&identity));
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -636,9 +643,10 @@ mod tests {
         let (quic, _quic_rx, quic_count) =
             make_transport(TransportCost::Metered, TransportKind::Quic, true);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(ble);
-        router.register_transport(quic);
+        router.register_transport(ble, Arc::clone(&identity));
+        router.register_transport(quic, Arc::clone(&identity));
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -680,8 +688,9 @@ mod tests {
         let (transport, mut rx, count) =
             make_transport_with_failures(TransportCost::Free, TransportKind::Ble, 1);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(transport);
+        router.register_transport(transport, Arc::clone(&identity));
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -710,8 +719,9 @@ mod tests {
         let (ble, _ble_rx, ble_count) =
             make_transport(TransportCost::Free, TransportKind::Ble, false);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(ble);
+        router.register_transport(ble, Arc::clone(&identity));
 
         // No yield: monitoring task has not run, available = false.
         let sender_id = NodeIdentity::generate();
@@ -734,8 +744,9 @@ mod tests {
     async fn connect_returns_peer_id_on_success() {
         let (transport, mut rx, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
 
+        let identity = Arc::new(NodeIdentity::generate());
         let mut router = Router::new();
-        router.register_transport(transport);
+        router.register_transport(transport, Arc::clone(&identity));
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -770,7 +781,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for StartFailNTimes {
-        async fn start(&self) -> Result<()> {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
             let n =
                 self.remaining_failures
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -820,7 +831,12 @@ mod tests {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
-        tokio::spawn(health_monitor(t, started_tx, Arc::clone(&available)));
+        tokio::spawn(health_monitor(
+            t,
+            started_tx,
+            Arc::clone(&available),
+            Arc::new(NodeIdentity::generate()),
+        ));
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -844,6 +860,7 @@ mod tests {
             transport,
             started_tx,
             Arc::clone(&available),
+            Arc::new(NodeIdentity::generate()),
         ));
 
         // Yield so the initial start() runs and fails.
@@ -885,6 +902,7 @@ mod tests {
             transport,
             started_tx,
             Arc::clone(&available),
+            Arc::new(NodeIdentity::generate()),
         ));
 
         tokio::task::yield_now().await;
@@ -921,7 +939,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for ControllableDiscoverTransport {
-        async fn start(&self) -> Result<()> {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
             Ok(())
         }
         async fn stop(&self) -> Result<()> {

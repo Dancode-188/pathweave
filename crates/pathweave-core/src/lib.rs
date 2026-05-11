@@ -216,7 +216,7 @@ pub trait MessageHandler: Send + Sync {
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn start(&self) -> Result<()>;
+    async fn start(&self, identity: &NodeIdentity) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     fn discover(&self) -> BoxStream<'static, PeerAnnouncement>;
     async fn connect(&self, peer: &PeerAnnouncement) -> Result<Box<dyn Connection>>;
