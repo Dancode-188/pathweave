@@ -399,7 +399,6 @@ async fn macos_peripheral_task(
     mut subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-
     'outer: loop {
         tokio::select! {
             _ = &mut stop_rx => break 'outer,
