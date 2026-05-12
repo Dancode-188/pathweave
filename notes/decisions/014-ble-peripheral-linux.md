@@ -1,4 +1,4 @@
-# ADR 014: Linux BLE peripheral mode via bluer v0.17
+# ADR 014: BLE peripheral mode: bluer on Linux, WinRT on Windows
 
 **Status:** Accepted
 
@@ -9,15 +9,16 @@ and accepting GATT connections from scanning centrals. ADR 006 settled the split
 central mode uses `btleplug` on all platforms; peripheral mode uses `bluer` v0.17 on
 Linux. ADR 010 settled that `Transport::start()` takes `&NodeIdentity`.
 
-Three design questions remained open:
+Three design questions remained open for Linux:
 
 1. Which bluer data-path API to use for the GATT server
 2. How `accept()` maps onto bluer's event-driven model
 3. How `bluer` and `btleplug` coexist inside the same crate
 
-This ADR settles all three.
+This ADR settles all three for Linux, and adds a Windows section covering the
+WinRT-based implementation via the `windows` crate (v0.58).
 
-## bluer v0.17 GATT server data API
+## Linux: bluer v0.17 GATT server data API
 
 bluer exposes two data-path variants for GATT server characteristics:
 
@@ -50,6 +51,38 @@ Events on the notify characteristic:
   `CharacteristicWriter` (implements `AsyncWrite`) remains valid until the central
   disconnects or `_app_handle` is dropped.
 
+## Windows: WinRT GATT server data API (windows crate v0.58)
+
+WinRT GATT server events arrive as `TypedEventHandler` callbacks on Windows thread
+pool threads, not as an async stream. The `windows` crate (Microsoft's official WinRT
+bindings, v0.58) exposes:
+
+- `GattServiceProvider::CreateAsync`: creates the GATT service and starts the
+  underlying GATT server.
+- `GattLocalCharacteristic`: represents a characteristic. Events are registered via
+  `WriteRequested` (fires when a central writes) and `SubscribedClientsChanged` (fires
+  when the subscribed-client set changes).
+- `GattServiceProviderAdvertisingParameters`: controls advertisement including
+  `SetServiceData` (Windows 10 version 1903+, Build 18362, `IGattServiceProviderAdvertisingParameters2`).
+- `GattServiceProvider::StopAdvertising`: stops BLE advertisement packets. Does NOT
+  close event handlers or the GATT server itself.
+
+Two key behavioral differences from bluer determine the Windows architecture:
+
+**TypedEventHandler callbacks run outside tokio.** WinRT dispatches write and
+subscribe events to Windows thread pool threads. These threads are not inside any
+tokio runtime. `tokio::runtime::Handle::block_on()` is therefore safe: it enters a
+non-async context onto the current thread's stack, which is already outside tokio.
+
+**StopAdvertising() does not close GATT event streams.** On Linux, dropping
+`ApplicationHandle` causes bluer to unregister the GATT application, which closes
+the `CharacteristicControl` streams and exits `peripheral_loop`. On Windows,
+`StopAdvertising()` stops advertisement packets only; the `WriteRequested` and
+`SubscribedClientsChanged` handlers remain registered. There is no WinRT equivalent
+of a stream that closes when the service is stopped. Instead, a tokio oneshot sender
+(`_stop_signal` in `BlePeripheralState`) is the only mechanism that exits
+`windows_peripheral_task` and drops `conn_tx`, which unblocks `accept()`.
+
 ## Decision
 
 ### GATT characteristic configuration
@@ -76,17 +109,20 @@ acknowledgement. Delivery guarantees are provided by the at-least-once retry loo
 
 ### bluer/btleplug coexistence
 
-`BleTransport` gains one Linux-only field:
+`BleTransport` gains two fields shared by Linux and Windows:
 
 ```rust
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 peripheral: Arc<tokio::sync::Mutex<Option<BlePeripheralState>>>,
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+conn_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 ```
 
-All bluer types are gated under `#[cfg(target_os = "linux")]`. The btleplug
-central-mode field (`adapter: Arc<Mutex<Option<Adapter>>>`) is unchanged and
-platform-independent. On macOS and Windows, `bluer` is absent from the dependency
-tree and `accept()` returns the existing not-implemented error.
+All bluer types are gated under `#[cfg(target_os = "linux")]`; all WinRT types under
+`#[cfg(target_os = "windows")]`. The btleplug central-mode field
+(`adapter: Arc<Mutex<Option<Adapter>>>`) is unchanged and platform-independent. On
+macOS, neither `bluer` nor `windows` is in the dependency tree and `accept()` returns
+the not-implemented error.
 
 `pathweave-transport-ble/Cargo.toml` adds a
 `[target.'cfg(target_os = "linux")'.dependencies]` section with
@@ -259,8 +295,12 @@ write events from the same subscriber. Reply bytes flow from connections through
 
 ### accept()
 
+The `accept()` implementation is shared between Linux and Windows. The
+platform-specific difference is only in what causes `recv()` to return `None` (bluer
+handle drop vs. stop signal drop), not in the `accept()` body itself.
+
 ```rust
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn accept(&self) -> Result<Box<dyn Connection>> {
     let mut guard = self.conn_rx.lock().await;
     match guard.as_mut() {
@@ -278,15 +318,104 @@ The guard on `self.conn_rx` is held across `recv()`. See the rationale section f
 why this is safe with respect to `stop()`, and why `conn_rx` must live on
 `BleTransport` rather than inside `BlePeripheralState`.
 
+### Transport::start() on Windows
+
+`BleTransport::start_peripheral(&identity)` on Windows executes the following sequence:
+
+1. Create `GattServiceProvider` via `GattServiceProvider::CreateAsync(service_uuid).await`.
+2. Create write and notify `GattLocalCharacteristic` via `service.CreateCharacteristicAsync().await`.
+3. Register `WriteRequested` handler on the write characteristic. The handler uses
+   `IAsyncOperation::get()` to block synchronously on `args.GetRequestAsync()`, reads
+   bytes via `DataReader::FromBuffer`, and forwards them to the active connection
+   channel via `write_forward`.
+4. Register `SubscribedClientsChanged` handler on the notify characteristic. The handler
+   signals `subscribe_tx` when `SubscribedClients().Size() > 0`.
+5. Build the advertisement: set service data to `[0x01] ++ short_id` via
+   `GattServiceProviderAdvertisingParameters::SetServiceData` (Windows 10 1903+, Build 18362).
+6. Call `service_provider.StartAdvertisingWithParameters(&adv_params)`.
+7. Create channels: unbounded `(conn_tx, conn_rx)`, unbounded `(subscribe_tx, subscribe_rx)`,
+   oneshot `(stop_tx, stop_rx)`.
+8. Spawn `windows_peripheral_task(service_provider, notify_char, conn_tx, write_forward,
+   subscribe_rx, stop_rx)`.
+9. Store `conn_rx` in `self.conn_rx`, store `BlePeripheralState { _stop_signal: stop_tx }`
+   in `self.peripheral`.
+
+### windows_peripheral_task
+
+`windows_peripheral_task` is the Windows equivalent of `peripheral_loop`. It drives
+the connection lifecycle from the tokio side, bridging WinRT callback events
+(delivered to channels by the handlers registered in `start_peripheral`) into the
+`BlePeripheralConnection` channel-based model.
+
+Structure is a `'outer` loop waiting for a subscriber signal or stop signal, and an
+inner loop forwarding replies until the connection drops or a stop signal fires:
+
+```rust
+'outer: loop {
+    // Wait for subscribe signal or stop
+    tokio::select! {
+        _ = &mut stop_rx => break 'outer,
+        msg = subscribe_rx.recv() => { if msg.is_none() { break 'outer; } }
+    }
+
+    // Create connection and install write_forward sender
+    let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    *write_forward.lock().unwrap() = Some(write_tx);
+    let _ = conn_tx.send(BlePeripheralConnection { write_rx: Mutex::new(write_rx), reply_tx });
+
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => break 'outer,
+            data = reply_rx.recv() => match data {
+                Some(bytes) => { /* call notify_char.NotifyValueAsync(&buffer).await */ }
+                None => break,   // connection dropped; loop back to wait for next subscriber
+            },
+            _ = subscribe_rx.recv() => {
+                tracing::debug!("second subscriber while active; ignored");
+            }
+        }
+    }
+    *write_forward.lock().unwrap() = None;
+}
+// cleanup
+*write_forward.lock().unwrap() = None;
+let _ = service_provider.StopAdvertising();
+```
+
+On connection drop (`reply_rx.recv()` returns `None`), the inner loop breaks and
+`write_forward` is cleared. The outer loop waits for the next subscriber. On stop
+signal, both loops exit and `conn_tx` is dropped, unblocking any waiting `accept()`.
+
+### BlePeripheralState on Windows
+
+```rust
+#[cfg(target_os = "windows")]
+struct BlePeripheralState {
+    _stop_signal: tokio::sync::oneshot::Sender<()>,
+}
+```
+
+Dropping this struct drops `_stop_signal`. The `stop_rx` end of the oneshot detects
+the drop (`recv()` returns `Err(RecvError)`), causing the `stop_rx => break 'outer`
+arm in `windows_peripheral_task` to fire. The task exits and drops `conn_tx`. The
+`recv()` waiting in `accept()` returns `None`; `accept()` returns an error and
+releases the `conn_rx` guard. `stop()` then acquires `self.conn_rx` and clears it.
+
 ### BlePeripheralConnection
 
 ```rust
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct BlePeripheralConnection {
     write_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
-    reply_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    reply_tx:  tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 ```
+
+`BlePeripheralConnection` is platform-independent. Both Linux and Windows wire their
+platform-specific events into these channels and hand the connection to `accept()`.
+`Session::respond()` then drives the Noise_XX handshake over `recv_bytes`/`send_bytes`
+without knowing what is underneath.
 
 `write_rx` is wrapped in `tokio::sync::Mutex` to satisfy `Connection: Sync`.
 `recv_bytes` takes `&mut self`, so there is never actual contention on this lock.
@@ -390,17 +519,81 @@ returns `None`; `accept()` returns an error and releases the `conn_rx` guard. `s
 then acquires `self.conn_rx` and clears it so subsequent `accept()` calls return
 "transport not started" rather than "peripheral loop ended".
 
+**Why .get() in the write handler and block_in_place() in start_peripheral?**
+
+`windows` crate 0.52+ removed the `std::future::Future` implementation for
+`IAsyncOperation<T>`. WinRT async operations can no longer be `.await`ed directly.
+The two patterns used here reflect the execution context:
+
+In the `WriteRequested` handler, the callback runs on a Windows thread pool thread
+that is not inside any tokio runtime. `IAsyncOperation::get()` blocks synchronously;
+that is safe here because there is no tokio executor to block. `GetRequestAsync()`
+resolves immediately since the WinRT stack already holds the completed request.
+
+In `start_peripheral`, the three creation calls (`GattServiceProvider::CreateAsync`,
+`CreateCharacteristicAsync`) run inside the tokio async executor. Using `.get()`
+directly would block a tokio worker thread. `tokio::task::block_in_place()` is
+used instead: it notifies tokio to migrate other tasks away from the current thread
+before blocking, and restores the thread to the pool when the blocking call returns.
+This requires the multi-threaded tokio runtime, which is the standard configuration.
+
+In `windows_peripheral_task`, `NotifyValueAsync` is called on a tokio task.
+`block_in_place` wraps the call for the same reason: the task runs on a tokio worker
+and must not block it directly.
+
+A dedicated bridge task or channel per write event would work but adds per-event
+overhead. The synchronous `.get()` pattern keeps the handler self-contained for
+fast-resolving operations.
+
+**Why Respond() is not called for write-without-response characteristics?**
+
+The Microsoft GATT server documentation and the official Windows-universal-samples
+BluetoothLE sample both show the conditional pattern:
+
+```
+if (request.Option == GattWriteOption.WriteWithResponse) { request.Respond(); }
+```
+
+`Respond()` is only appropriate for write-with-response operations; the WinRT API
+does not require it for write-without-response. Our characteristic is configured as
+`WriteWithoutResponse` only, so no incoming request will have `Option == WriteWithResponse`,
+and `Respond()` is never called. Calling it unconditionally for write-without-response
+operations is not supported by any Microsoft documentation and risks sending an
+unexpected ATT response to a central that did not request one.
+
+**Why is _stop_signal the only exit mechanism?**
+
+`GattServiceProvider::StopAdvertising()` stops advertising but does not unregister
+`WriteRequested` or `SubscribedClientsChanged` handlers. There is no WinRT API that
+closes event handler registrations without destroying the service provider entirely.
+Destroying `GattServiceProvider` from a thread that is not the WinRT background
+thread (i.e., from tokio's drop glue) is unsafe on some Windows builds.
+
+The `_stop_signal` oneshot avoids all of this. When dropped (in `stop()`), it fires
+the `stop_rx => break 'outer` select arm in `windows_peripheral_task`, which exits
+cleanly and drops `conn_tx` from within the tokio runtime.
+
 ## Implications
 
 - `bluer` is added as a `[target.'cfg(target_os = "linux")'.dependencies]` entry
   in `pathweave-transport-ble/Cargo.toml`.
-- `BleTransport` gains `peripheral` and `conn_rx` fields, `BlePeripheralState`, and
-  `BlePeripheralConnection` under `#[cfg(target_os = "linux")]`.
+- `windows` crate v0.58 is added as a `[target.'cfg(target_os = "windows")'.dependencies]`
+  entry with features: `Devices_Bluetooth`, `Devices_Bluetooth_GenericAttributeProfile`,
+  `Foundation`, `Foundation_Collections`, `Storage_Streams`.
+- `BlePeripheralConnection` is shared across Linux and Windows under
+  `#[cfg(any(target_os = "linux", target_os = "windows"))]`.
+- `BleTransport` gains `peripheral` and `conn_rx` fields under
+  `#[cfg(any(target_os = "linux", target_os = "windows"))]`.
+- `BlePeripheralState` is platform-specific: on Linux it holds RAII handles; on
+  Windows it holds `_stop_signal`.
 - `Transport::start()` signature changes to `start(&self, identity: &NodeIdentity)`.
 - `QuicTransport`, all mock transports in tests: add `_identity`.
 - `health_monitor()`, `Router::register_transport()`, `PathweaveNode::add_transport()`:
   propagate `Arc<NodeIdentity>` as described above.
-- `accept()` on non-Linux platforms returns the not-implemented error unchanged.
+- `accept()` is a single implementation under `any(linux, windows)`. On other
+  platforms it returns the not-implemented error unchanged.
 - Multiple simultaneous centrals are not supported in v0.2.0. A second subscriber
-  while a connection is active is dropped with a debug log.
-- macOS and Windows peripheral mode remain deferred per ADR 006.
+  while a connection is active is dropped with a debug log on both platforms.
+- Windows peripheral mode requires Windows 10 version 1903 (Build 18362) or later
+  for `SetServiceData` via `IGattServiceProviderAdvertisingParameters2`.
+- macOS peripheral mode remains deferred per ADR 006.

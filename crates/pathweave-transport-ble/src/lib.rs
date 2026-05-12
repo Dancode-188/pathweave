@@ -28,22 +28,20 @@ const NOTIFY_CHAR_UUID: Uuid = uuid!("6de63378-8bc3-4e87-8892-0a9a80efff64");
 const ADVERTISEMENT_VERSION: u8 = 0x01;
 
 // --------------------------------------------------------------------------
-// Linux-only peripheral types (ADR 014)
+// Shared peripheral connection type (Linux and Windows, ADR 014)
 // --------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
-struct BlePeripheralState {
-    _adv_handle: bluer::adv::AdvertisementHandle,
-    _app_handle: bluer::gatt::local::ApplicationHandle,
-}
-
-#[cfg(target_os = "linux")]
+// BlePeripheralConnection is platform-independent: the peripheral task on each
+// platform wires its platform-specific events into these channels and hands the
+// connection to accept(). Session::respond() then drives the Noise_XX handshake
+// over recv_bytes/send_bytes without knowing what's underneath.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct BlePeripheralConnection {
     write_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
     reply_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[async_trait]
 impl Connection for BlePeripheralConnection {
     async fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -68,6 +66,16 @@ impl Connection for BlePeripheralConnection {
     fn mtu(&self) -> usize {
         512
     }
+}
+
+// --------------------------------------------------------------------------
+// Linux-only peripheral types (ADR 014)
+// --------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+struct BlePeripheralState {
+    _adv_handle: bluer::adv::AdvertisementHandle,
+    _app_handle: bluer::gatt::local::ApplicationHandle,
 }
 
 // peripheral_loop: sole owner of CharacteristicWriter, bridges bluer events to connections.
@@ -145,14 +153,121 @@ async fn peripheral_loop(
 }
 
 // --------------------------------------------------------------------------
+// Windows-only peripheral types (ADR 014, Windows section)
+// --------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn uuid_to_guid(uuid: &Uuid) -> windows::core::GUID {
+    let b = uuid.as_bytes();
+    windows::core::GUID::from_values(
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        u16::from_be_bytes([b[4], b[5]]),
+        u16::from_be_bytes([b[6], b[7]]),
+        [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn bytes_to_ibuffer(bytes: &[u8]) -> windows::core::Result<windows::Storage::Streams::IBuffer> {
+    let writer = windows::Storage::Streams::DataWriter::new()?;
+    writer.WriteBytes(bytes)?;
+    writer.DetachBuffer()
+}
+
+// BlePeripheralState on Windows holds only the stop signal. The background task
+// (windows_peripheral_task) owns the GattServiceProvider and calls StopAdvertising()
+// when the stop signal fires.
+//
+// StopAdvertising() stops BLE advertisement packets but does NOT close the
+// WriteRequested or SubscribedClientsChanged event registrations. Dropping this
+// struct (which drops _stop_signal) is therefore the only mechanism that exits
+// windows_peripheral_task and drops conn_tx, unblocking any waiting accept() call.
+// Calling StopAdvertising() directly in stop() without this signal would leave
+// peripheral_task running and accept() blocked indefinitely.
+#[cfg(target_os = "windows")]
+struct BlePeripheralState {
+    _stop_signal: tokio::sync::oneshot::Sender<()>,
+}
+
+// windows_peripheral_task: Windows equivalent of peripheral_loop.
+//
+// WinRT GATT server events arrive as TypedEventHandler callbacks on Windows thread
+// pool threads, not as an async stream. start_peripheral() registers the handlers
+// and bridges them to tokio channels; this task drives the connection lifecycle from
+// the tokio side.
+//
+// Rejects a second subscriber while a connection is active (v0.2.0 limitation).
+// Calls StopAdvertising() and exits when the stop signal fires.
+#[cfg(target_os = "windows")]
+async fn windows_peripheral_task(
+    service_provider: windows::Devices::Bluetooth::GenericAttributeProfile::GattServiceProvider,
+    notify_char: windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic,
+    conn_tx: tokio::sync::mpsc::UnboundedSender<BlePeripheralConnection>,
+    write_forward: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+    mut subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    'outer: loop {
+        tokio::select! {
+            _ = &mut stop_rx => break 'outer,
+            msg = subscribe_rx.recv() => {
+                if msg.is_none() { break 'outer; }
+            }
+        }
+
+        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+        if let Ok(mut guard) = write_forward.lock() {
+            *guard = Some(write_tx);
+        }
+
+        let _ = conn_tx.send(BlePeripheralConnection {
+            write_rx: Mutex::new(write_rx),
+            reply_tx,
+        });
+
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break 'outer,
+                data = reply_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            if let Ok(buffer) = bytes_to_ibuffer(&bytes) {
+                                if let Ok(op) = notify_char.NotifyValueAsync(&buffer) {
+                                    let _ = tokio::task::block_in_place(|| op.get());
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = subscribe_rx.recv() => {
+                    tracing::debug!("BLE peripheral (Windows): second subscriber while connection active; ignored");
+                }
+            }
+        }
+
+        if let Ok(mut guard) = write_forward.lock() {
+            *guard = None;
+        }
+    }
+
+    if let Ok(mut guard) = write_forward.lock() {
+        *guard = None;
+    }
+    let _ = service_provider.StopAdvertising();
+}
+
+// --------------------------------------------------------------------------
 // Transport
 // --------------------------------------------------------------------------
 
 pub struct BleTransport {
     adapter: Arc<Mutex<Option<Adapter>>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     peripheral: Arc<Mutex<Option<BlePeripheralState>>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     conn_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 }
 
@@ -160,9 +275,9 @@ impl BleTransport {
     pub fn new() -> Self {
         Self {
             adapter: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             peripheral: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             conn_rx: Mutex::new(None),
         }
     }
@@ -177,7 +292,6 @@ impl Default for BleTransport {
 #[async_trait]
 impl Transport for BleTransport {
     async fn start(&self, identity: &NodeIdentity) -> Result<()> {
-        // Central mode: acquire btleplug adapter for scanning.
         let manager = Manager::new()
             .await
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
@@ -191,12 +305,10 @@ impl Transport for BleTransport {
             .ok_or_else(|| PathweaveError::Transport("no Bluetooth adapter found".into()))?;
         *self.adapter.lock().await = Some(adapter);
 
-        // Peripheral mode: register GATT application and begin advertising (Linux only).
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.start_peripheral(identity).await?;
 
-        // Suppress unused-variable warning on non-Linux.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let _ = identity;
 
         Ok(())
@@ -209,16 +321,19 @@ impl Transport for BleTransport {
         }
         *guard = None;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            // Dropping BlePeripheralState drops _adv_handle and _app_handle,
-            // which unregisters the advertisement and GATT application via bluer's
-            // RAII guards. This also closes peripheral_loop's control streams,
-            // causing it to exit and drop conn_tx, which unblocks any waiting
-            // accept() call (recv() returns None and releases the conn_rx lock).
+            // On Linux: dropping BlePeripheralState drops the bluer RAII handles,
+            // which closes the CharacteristicControl streams and causes peripheral_loop
+            // to exit, dropping conn_tx.
+            //
+            // On Windows: dropping BlePeripheralState drops _stop_signal, which is
+            // the only mechanism that exits windows_peripheral_task and drops conn_tx.
+            // StopAdvertising() alone does not close GATT event streams.
+            //
+            // In both cases, conn_tx dropping causes accept()'s recv() to return None,
+            // releasing the conn_rx guard so we can acquire it here to clear it.
             *self.peripheral.lock().await = None;
-            // Clear conn_rx after peripheral is dropped so subsequent accept() calls
-            // return "transport not started" rather than "peripheral loop ended".
             *self.conn_rx.lock().await = None;
         }
 
@@ -226,11 +341,6 @@ impl Transport for BleTransport {
     }
 
     /// Returns a stream of nearby Pathweave peers found via BLE scanning.
-    ///
-    /// Starts a background task that filters `ServiceDataAdvertisement` events
-    /// for the Pathweave service UUID and decodes the short_id from service data.
-    /// The stream ends when the sender is dropped (i.e., after `stop()` clears the
-    /// adapter and the event stream closes).
     fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
         let adapter_arc = Arc::clone(&self.adapter);
         let (tx, rx) = mpsc::unbounded::<PeerAnnouncement>();
@@ -267,7 +377,6 @@ impl Transport for BleTransport {
                         Some(d) => d.clone(),
                         None => continue,
                     };
-                    // Validate advertisement format: [0x01] ++ [short_id: 8 bytes]
                     if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
                         continue;
                     }
@@ -277,7 +386,7 @@ impl Transport for BleTransport {
                         short_id: Some(short_id),
                     };
                     if tx.unbounded_send(announcement).is_err() {
-                        break; // receiver dropped
+                        break;
                     }
                 }
             }
@@ -286,10 +395,6 @@ impl Transport for BleTransport {
         Box::pin(rx)
     }
 
-    /// Connects to a previously discovered BLE peer.
-    ///
-    /// The peer must have been seen via `discover()` before this is called because
-    /// `btleplug` looks up the peripheral from the adapter's internal scan cache.
     async fn connect(&self, peer: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
         let id_str = match &peer.address {
             PeerAddress::Ble(s) => s.clone(),
@@ -304,10 +409,6 @@ impl Transport for BleTransport {
                 .clone()
         };
 
-        // Find the peripheral in the scan cache by matching its platform ID string.
-        // The format is platform-specific (BlueZ device path on Linux, UUID on macOS,
-        // BDAddr on Windows), but we always store whatever id().to_string() returns in
-        // discover(), so the comparison is consistent within a session.
         let peripherals = adapter
             .peripherals()
             .await
@@ -357,9 +458,6 @@ impl Transport for BleTransport {
             .await
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
-        // btleplug's notification stream is Send but not Sync. Bridge it to a
-        // tokio channel via a background task; the receiver goes into a Mutex to
-        // satisfy Connection: Sync.
         let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         tokio::spawn(async move {
             futures::pin_mut!(notifications);
@@ -377,12 +475,12 @@ impl Transport for BleTransport {
         }))
     }
 
-    #[cfg(target_os = "linux")]
+    // Borrow conn_rx from self (lifetime 'life0: 'async_trait). Holding the guard
+    // across recv() is safe: stop() drops BlePeripheralState first (closing conn_tx
+    // via the peripheral task exiting), causing recv() to return None and accept()
+    // to release the guard. stop() then acquires the lock to clear it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     async fn accept(&self) -> Result<Box<dyn Connection>> {
-        // Borrow conn_rx from self (lifetime 'life0: 'async_trait). Holding the guard
-        // across recv() is safe: stop() drops BlePeripheralState first (which closes
-        // conn_tx via peripheral_loop exit), causing recv() to return None and accept()
-        // to release the guard. stop() then acquires the lock to clear it.
         let mut guard = self.conn_rx.lock().await;
         match guard.as_mut() {
             Some(rx) => rx
@@ -394,10 +492,10 @@ impl Transport for BleTransport {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     async fn accept(&self) -> Result<Box<dyn Connection>> {
         Err(PathweaveError::Transport(
-            "BLE peripheral mode requires Linux with BlueZ".into(),
+            "BLE peripheral mode not supported on this platform".into(),
         ))
     }
 
@@ -417,6 +515,10 @@ impl Transport for BleTransport {
         "ble"
     }
 }
+
+// --------------------------------------------------------------------------
+// Linux peripheral: start_peripheral (ADR 014)
+// --------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 impl BleTransport {
@@ -507,6 +609,168 @@ impl BleTransport {
 }
 
 // --------------------------------------------------------------------------
+// Windows peripheral: start_peripheral (ADR 014, Windows section)
+// --------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+impl BleTransport {
+    async fn start_peripheral(&self, identity: &NodeIdentity) -> Result<()> {
+        use windows::Devices::Bluetooth::GenericAttributeProfile::{
+            GattCharacteristicProperties, GattLocalCharacteristicParameters, GattServiceProvider,
+            GattServiceProviderAdvertisingParameters,
+        };
+        use windows::Foundation::TypedEventHandler;
+        use windows::Storage::Streams::DataReader;
+
+        let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8].try_into().unwrap();
+
+        let write_forward: Arc<
+            std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let (subscribe_tx, subscribe_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<BlePeripheralConnection>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // IAsyncOperation<T> does not implement Future in windows crate 0.52+.
+        // Use block_in_place (safe on multi-threaded tokio) with .get() for init calls.
+        let service_result = tokio::task::block_in_place(|| {
+            GattServiceProvider::CreateAsync(uuid_to_guid(&PATHWEAVE_SERVICE_UUID))?.get()
+        })
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        let service_provider = service_result
+            .ServiceProvider()
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        let service = service_provider
+            .Service()
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        let write_params = GattLocalCharacteristicParameters::new()
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        write_params
+            .SetCharacteristicProperties(GattCharacteristicProperties::WriteWithoutResponse)
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        let write_char = tokio::task::block_in_place(|| {
+            service
+                .CreateCharacteristicAsync(uuid_to_guid(&WRITE_CHAR_UUID), &write_params)?
+                .get()
+        })
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?
+        .Characteristic()
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        let notify_params = GattLocalCharacteristicParameters::new()
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        notify_params
+            .SetCharacteristicProperties(GattCharacteristicProperties::Notify)
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        let notify_char = tokio::task::block_in_place(|| {
+            service
+                .CreateCharacteristicAsync(uuid_to_guid(&NOTIFY_CHAR_UUID), &notify_params)?
+                .get()
+        })
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?
+        .Characteristic()
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        // Write handler runs on a WinRT thread pool thread, not inside the tokio
+        // runtime. IAsyncOperation::get() blocks synchronously; that is safe here
+        // because this thread is outside the tokio executor. GetRequestAsync() resolves
+        // immediately since the WinRT stack already holds the completed request.
+        // Respond() is not called: the Microsoft GATT server docs show the conditional
+        // pattern (Respond only for WriteWithResponse). Our characteristic is
+        // WriteWithoutResponse only, so Respond() is never appropriate here.
+        let write_forward_clone = Arc::clone(&write_forward);
+        write_char
+            .WriteRequested(&TypedEventHandler::new(
+                move |_,
+                      args: &Option<
+                    windows::Devices::Bluetooth::GenericAttributeProfile::GattWriteRequestedEventArgs,
+                >| {
+                    let Some(args) = args else { return Ok(()); };
+                    let Ok(request) = args.GetRequestAsync().and_then(|op| op.get()) else {
+                        return Ok(());
+                    };
+                    let reader = DataReader::FromBuffer(&request.Value()?)?;
+                    let len = reader.UnconsumedBufferLength()? as usize;
+                    let mut buf = vec![0u8; len];
+                    reader.ReadBytes(&mut buf)?;
+                    if let Ok(guard) = write_forward_clone.lock() {
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.send(Bytes::from(buf));
+                        } else {
+                            tracing::debug!("BLE peripheral (Windows): write with no active connection; frame discarded");
+                        }
+                    }
+                    Ok(())
+                },
+            ))
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        // Subscribe handler fires on subscribe and unsubscribe. Only signal
+        // peripheral_task when at least one client is currently subscribed.
+        notify_char
+            .SubscribedClientsChanged(&TypedEventHandler::new(
+                move |char: &Option<
+                    windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic,
+                >,
+                      _| {
+                    let Some(c) = char else {
+                        return Ok(());
+                    };
+                    if c.SubscribedClients()?.Size()? > 0 {
+                        let _ = subscribe_tx.send(());
+                    }
+                    Ok(())
+                },
+            ))
+            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+        // Scoped block: IBuffer and GattServiceProviderAdvertisingParameters are not
+        // Send, so they must be dropped before the first .await below.
+        {
+            // Service data: [0x01] ++ [short_id: 8 bytes]. SetServiceData requires
+            // Windows 10 version 1903+ (Build 18362, IGattServiceProviderAdvertisingParameters2).
+            let mut svc_data = vec![ADVERTISEMENT_VERSION];
+            svc_data.extend_from_slice(&short_id);
+            let buffer = bytes_to_ibuffer(&svc_data)
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+            let adv_params = GattServiceProviderAdvertisingParameters::new()
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+            adv_params
+                .SetIsConnectable(true)
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+            adv_params
+                .SetIsDiscoverable(true)
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+            adv_params
+                .SetServiceData(&buffer)
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+
+            service_provider
+                .StartAdvertisingWithParameters(&adv_params)
+                .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        }
+
+        tokio::spawn(windows_peripheral_task(
+            service_provider,
+            notify_char,
+            conn_tx,
+            write_forward,
+            subscribe_rx,
+            stop_rx,
+        ));
+
+        *self.conn_rx.lock().await = Some(conn_rx);
+        *self.peripheral.lock().await = Some(BlePeripheralState {
+            _stop_signal: stop_tx,
+        });
+
+        Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------
 // Central-mode connection (btleplug)
 // --------------------------------------------------------------------------
 
@@ -514,9 +778,8 @@ pub struct BleConnection {
     peripheral: Peripheral,
     write_char: Characteristic,
     // GATT is message-oriented: each notification is a complete frame.
-    // No length-prefix framing is needed (unlike QUIC's byte stream).
-    // Wrapped in Mutex to satisfy Connection: Sync; recv_bytes holds &mut self
-    // so there is never actual contention on the lock.
+    // No length-prefix framing needed (unlike QUIC's byte stream).
+    // Wrapped in Mutex to satisfy Connection: Sync.
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
 }
 
@@ -562,7 +825,6 @@ mod tests {
     #[tokio::test]
     async fn wrong_address_type_returns_error() {
         let transport = BleTransport::new();
-        // start() not called: adapter is None
         let peer = PeerAnnouncement {
             address: PeerAddress::Quic("127.0.0.1:1234".parse().unwrap()),
             short_id: None,
@@ -582,15 +844,15 @@ mod tests {
         assert!(matches!(result, Err(PathweaveError::Transport(_))));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[tokio::test]
-    async fn accept_returns_not_implemented_on_non_linux() {
+    async fn accept_returns_not_supported_on_other_platforms() {
         let transport = BleTransport::new();
         let result = transport.accept().await;
         assert!(matches!(result, Err(PathweaveError::Transport(_))));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[tokio::test]
     async fn accept_before_start_returns_error() {
         let transport = BleTransport::new();
