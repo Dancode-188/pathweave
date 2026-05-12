@@ -470,8 +470,8 @@ Peripheral mode: platform-specific.
 - macOS: not yet implemented. CoreBluetooth is available on macOS (same framework as
   iOS); the implementation will be compile-tested on CI with community hardware testing.
   Tracked in issue #52.
-- Windows: not yet implemented. WinRT GATT Server API (Windows.Devices.Bluetooth).
-  Tracked in issue #51.
+- Windows: `windows` crate v0.58, shipped in v0.2.0. WinRT GATT Server API
+  (`Windows.Devices.Bluetooth.GenericAttributeProfile`). See ADR 014.
 
 **BLE peripheral and NodeIdentity**
 
@@ -531,8 +531,8 @@ When neither transport can reach the peer: "message failed: no transport availab
 No queuing, no silent retry.
 
 BLE in pw-chat works when at least one peer can advertise. Supported configurations:
-two Linux machines, a Linux machine and a Windows or macOS machine (pending issues
-#51 and #52), or any of the above and a phone running the native SDK.
+two Linux machines, a Linux or Windows machine and a macOS machine (pending issue
+#52), or any of the above and a phone running the native SDK.
 
 ---
 
@@ -548,7 +548,7 @@ Being clear about this matters as much as being clear about what it does.
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
 - No WiFi vs. mobile data detection for QUIC cost reporting (v0.2.0 cost intelligence
   work not yet complete; all QUIC connections currently report Metered)
-- No BLE peripheral mode on macOS or Windows yet (in progress, issues #51 and #52)
+- No BLE peripheral mode on macOS yet (in progress, issue #52)
 - No security audit completed
 
 v1.0.0 means the API is stable and the library is ready for production use. We're
