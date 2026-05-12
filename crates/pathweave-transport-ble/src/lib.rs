@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use btleplug::{
     api::{
-        Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+        Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+        ScanFilter, WriteType,
     },
     platform::{Adapter, Manager, Peripheral},
 };
@@ -35,13 +36,13 @@ const ADVERTISEMENT_VERSION: u8 = 0x01;
 // platform wires its platform-specific events into these channels and hands the
 // connection to accept(). Session::respond() then drives the Noise_XX handshake
 // over recv_bytes/send_bytes without knowing what's underneath.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 struct BlePeripheralConnection {
     write_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
     reply_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[async_trait]
 impl Connection for BlePeripheralConnection {
     async fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -260,14 +261,225 @@ async fn windows_peripheral_task(
 }
 
 // --------------------------------------------------------------------------
+// macOS-only peripheral types (ADR 014, macOS section)
+// --------------------------------------------------------------------------
+
+// macOS mirrors Windows in lifecycle: _stop_signal drop exits macos_peripheral_task
+// and drops conn_tx, releasing any blocked accept() call. stopAdvertising() alone
+// does not unblock the channel receive.
+#[cfg(target_os = "macos")]
+struct BlePeripheralState {
+    _stop_signal: tokio::sync::oneshot::Sender<()>,
+}
+
+// PeripheralDelegateBridge holds the channels that macos_peripheral_task reads from.
+// The delegate fires CoreBluetooth callbacks on its dispatch queue thread and sends
+// into these channels without any tokio runtime involvement.
+#[cfg(target_os = "macos")]
+struct PeripheralDelegateBridge {
+    subscribe_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    write_forward: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+}
+
+// MacosPeripheralDelegate: Objective-C class that implements CBPeripheralManagerDelegate.
+//
+// The write characteristic is declared with CBCharacteristicPropertyWrite (write with
+// response), not WriteWithoutResponse. CoreBluetooth's peripheralManager:didReceiveWriteRequests:
+// is only called for write-with-response; write commands are silently dropped on macOS.
+// This means the central must use WriteType::WithResponse when connecting to a macOS
+// peripheral, which BleConnection::send_bytes detects from the characteristic properties.
+#[cfg(target_os = "macos")]
+mod macos_delegate {
+    use super::*;
+    use objc2::rc::Retained;
+    use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
+    use objc2_core_bluetooth::{
+        CBATTError, CBCentral, CBCharacteristic, CBPeripheralManager, CBPeripheralManagerDelegate,
+    };
+    use objc2_foundation::{NSObject, NSObjectProtocol};
+
+    pub struct Ivars {
+        pub bridge: Arc<super::PeripheralDelegateBridge>,
+    }
+
+    define_class!(
+        // No thread_kind attribute: the default allows use from any thread.
+        // MainThreadOnly would require a main thread token at allocation time,
+        // which is unavailable on a tokio worker thread or dispatch queue thread.
+        #[unsafe(super(NSObject))]
+        #[name = "PathweaveMacosPeripheralDelegate"]
+        #[ivars = Ivars]
+        pub struct MacosPeripheralDelegate;
+
+        unsafe impl NSObjectProtocol for MacosPeripheralDelegate {}
+
+        unsafe impl CBPeripheralManagerDelegate for MacosPeripheralDelegate {
+            #[unsafe(method(peripheralManagerDidUpdateState:))]
+            fn did_update_state(&self, manager: &CBPeripheralManager) {
+                tracing::debug!("CBPeripheralManager state changed: {:?}", unsafe {
+                    manager.state()
+                });
+            }
+
+            #[unsafe(method(peripheralManager:central:didSubscribeToCharacteristic:))]
+            fn did_subscribe(
+                &self,
+                _manager: &CBPeripheralManager,
+                _central: &CBCentral,
+                _characteristic: &CBCharacteristic,
+            ) {
+                let _ = self.ivars().bridge.subscribe_tx.send(());
+            }
+
+            // Called only for CBCharacteristicPropertyWrite (write with response).
+            // Must call respondToRequest:withResult: for every request.
+            // WriteWithoutResponse commands are NOT delivered here.
+            #[unsafe(method(peripheralManager:didReceiveWriteRequests:))]
+            fn did_receive_writes(
+                &self,
+                manager: &CBPeripheralManager,
+                requests: &objc2_foundation::NSArray<objc2_core_bluetooth::CBATTRequest>,
+            ) {
+                for req in unsafe { requests.iter() } {
+                    if let Some(data) = unsafe { req.value() } {
+                        let bytes = Bytes::copy_from_slice(unsafe { data.as_bytes_unchecked() });
+                        if let Ok(guard) = self.ivars().bridge.write_forward.lock() {
+                            if let Some(tx) = guard.as_ref() {
+                                let _ = tx.send(bytes);
+                            } else {
+                                tracing::debug!(
+                                    "BLE peripheral (macOS): write with no active connection; frame discarded"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Respond to the first request; CoreBluetooth applies it to the batch.
+                if let Some(first) = unsafe { requests.firstObject_unchecked() } {
+                    unsafe { manager.respondToRequest_withResult(first, CBATTError::Success) };
+                }
+            }
+        }
+    );
+
+    impl MacosPeripheralDelegate {
+        pub fn new(bridge: Arc<super::PeripheralDelegateBridge>) -> Retained<Self> {
+            // set_ivars writes the Rust ivars into the allocated object memory before
+            // calling NSObject's init, required by objc2's DefinedClass contract.
+            let this = Self::alloc();
+            let this = this.set_ivars(Ivars { bridge });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+}
+
+// SendPtr<T>: raw pointer wrapper that is Send. CBPeripheralManager and
+// CBMutableCharacteristic are not Send on their own; wrapping them here lets
+// macos_peripheral_task's future be Send so tokio::spawn accepts it.
+#[cfg(target_os = "macos")]
+struct SendPtr<T>(*mut T);
+#[cfg(target_os = "macos")]
+unsafe impl<T> Send for SendPtr<T> {}
+
+// macos_peripheral_task: macOS equivalent of peripheral_loop / windows_peripheral_task.
+//
+// CBPeripheralManager and CBMutableCharacteristic are passed as SendPtr<T> because
+// those ObjC types are not Send. start_peripheral leaks the Retained<> objects before
+// spawning this task; this task reconstructs them from raw pointers (via
+// Retained::from_raw) on exit, releasing the ObjC objects. The delegate is not leaked:
+// the manager holds its own ObjC retain, so the Rust Retained<delegate> is allowed to
+// drop at the end of start_peripheral, reducing the count from 2 to 1. When the manager
+// is released here, the count goes from 1 to 0 and the delegate is freed.
+#[cfg(target_os = "macos")]
+async fn macos_peripheral_task(
+    manager: SendPtr<objc2_core_bluetooth::CBPeripheralManager>,
+    notify_char: SendPtr<objc2_core_bluetooth::CBMutableCharacteristic>,
+    conn_tx: tokio::sync::mpsc::UnboundedSender<BlePeripheralConnection>,
+    write_forward: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+    mut subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    'outer: loop {
+        tokio::select! {
+            _ = &mut stop_rx => break 'outer,
+            msg = subscribe_rx.recv() => {
+                if msg.is_none() { break 'outer; }
+            }
+        }
+
+        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+        if let Ok(mut guard) = write_forward.lock() {
+            *guard = Some(write_tx);
+        }
+        let _ = conn_tx.send(BlePeripheralConnection {
+            write_rx: Mutex::new(write_rx),
+            reply_tx,
+        });
+
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break 'outer,
+                data = reply_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            let mgr = manager.0;
+                            let chr = notify_char.0;
+                            tokio::task::block_in_place(|| {
+                                let data = unsafe {
+                                    objc2_foundation::NSData::with_bytes(bytes.as_ref())
+                                };
+                                unsafe {
+                                    (*mgr).updateValue_forCharacteristic_onSubscribedCentrals(
+                                        &data,
+                                        &*chr,
+                                        None,
+                                    );
+                                }
+                            });
+                        }
+                        None => break,
+                    }
+                }
+                _ = subscribe_rx.recv() => {
+                    tracing::debug!(
+                        "BLE peripheral (macOS): second subscriber while connection active; ignored"
+                    );
+                }
+            }
+        }
+
+        if let Ok(mut guard) = write_forward.lock() {
+            *guard = None;
+        }
+    }
+
+    if let Ok(mut guard) = write_forward.lock() {
+        *guard = None;
+    }
+
+    // Release the leaked ObjC objects. Retained::from_raw takes ownership of the one
+    // retain we forgot earlier; dropping it decrements the retain count. The manager
+    // cascades: its dealloc releases the service, which releases characteristics and
+    // delegate. notify_char_ptr is released here (its Rust-leaked retain); the service
+    // continues to hold its own retain until the manager releases it.
+    tokio::task::block_in_place(|| unsafe {
+        (*manager.0).stopAdvertising();
+        let _ = objc2::rc::Retained::from_raw(notify_char.0);
+        let _ = objc2::rc::Retained::from_raw(manager.0);
+    });
+}
+
+// --------------------------------------------------------------------------
 // Transport
 // --------------------------------------------------------------------------
 
 pub struct BleTransport {
     adapter: Arc<Mutex<Option<Adapter>>>,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     peripheral: Arc<Mutex<Option<BlePeripheralState>>>,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     conn_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 }
 
@@ -275,9 +487,9 @@ impl BleTransport {
     pub fn new() -> Self {
         Self {
             adapter: Arc::new(Mutex::new(None)),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             peripheral: Arc::new(Mutex::new(None)),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             conn_rx: Mutex::new(None),
         }
     }
@@ -305,10 +517,10 @@ impl Transport for BleTransport {
             .ok_or_else(|| PathweaveError::Transport("no Bluetooth adapter found".into()))?;
         *self.adapter.lock().await = Some(adapter);
 
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         self.start_peripheral(identity).await?;
 
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         let _ = identity;
 
         Ok(())
@@ -321,17 +533,17 @@ impl Transport for BleTransport {
         }
         *guard = None;
 
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
             // On Linux: dropping BlePeripheralState drops the bluer RAII handles,
             // which closes the CharacteristicControl streams and causes peripheral_loop
             // to exit, dropping conn_tx.
             //
-            // On Windows: dropping BlePeripheralState drops _stop_signal, which is
-            // the only mechanism that exits windows_peripheral_task and drops conn_tx.
-            // StopAdvertising() alone does not close GATT event streams.
+            // On Windows/macOS: dropping BlePeripheralState drops _stop_signal, which
+            // is the only mechanism that exits the peripheral task and drops conn_tx.
+            // StopAdvertising() alone does not close GATT event streams on either platform.
             //
-            // In both cases, conn_tx dropping causes accept()'s recv() to return None,
+            // In all cases, conn_tx dropping causes accept()'s recv() to return None,
             // releasing the conn_rx guard so we can acquire it here to clear it.
             *self.peripheral.lock().await = None;
             *self.conn_rx.lock().await = None;
@@ -372,22 +584,48 @@ impl Transport for BleTransport {
             futures::pin_mut!(events);
 
             while let Some(event) = events.next().await {
-                if let CentralEvent::ServiceDataAdvertisement { id, service_data } = event {
-                    let data = match service_data.get(&PATHWEAVE_SERVICE_UUID) {
-                        Some(d) => d.clone(),
-                        None => continue,
-                    };
-                    if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
-                        continue;
+                match event {
+                    CentralEvent::ServiceDataAdvertisement { id, service_data } => {
+                        let data = match service_data.get(&PATHWEAVE_SERVICE_UUID) {
+                            Some(d) => d.clone(),
+                            None => continue,
+                        };
+                        if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
+                            continue;
+                        }
+                        let short_id: [u8; 8] = data[1..9].try_into().unwrap();
+                        let announcement = PeerAnnouncement {
+                            address: PeerAddress::Ble(id.to_string()),
+                            short_id: Some(short_id),
+                        };
+                        if tx.unbounded_send(announcement).is_err() {
+                            break;
+                        }
                     }
-                    let short_id: [u8; 8] = data[1..9].try_into().unwrap();
-                    let announcement = PeerAnnouncement {
-                        address: PeerAddress::Ble(id.to_string()),
-                        short_id: Some(short_id),
-                    };
-                    if tx.unbounded_send(announcement).is_err() {
-                        break;
+                    // macOS (and iOS) peripherals cannot include service data in
+                    // advertisements; CoreBluetooth silently drops the key. They
+                    // advertise only their service UUID, which btleplug surfaces as
+                    // ServicesAdvertisement. short_id is None; Noise_XX provides
+                    // full identity during the handshake.
+                    //
+                    // No deduplication against ServiceDataAdvertisement: Linux and
+                    // Windows peripherals always produce ServiceDataAdvertisement
+                    // (they set service data explicitly) and macOS/iOS always produce
+                    // ServicesAdvertisement (they cannot set service data). Both events
+                    // firing for the same device in a Pathweave scan is not a realistic
+                    // scenario.
+                    CentralEvent::ServicesAdvertisement { id, services }
+                        if services.contains(&PATHWEAVE_SERVICE_UUID) =>
+                    {
+                        let announcement = PeerAnnouncement {
+                            address: PeerAddress::Ble(id.to_string()),
+                            short_id: None,
+                        };
+                        if tx.unbounded_send(announcement).is_err() {
+                            break;
+                        }
                     }
+                    _ => {}
                 }
             }
         });
@@ -479,7 +717,7 @@ impl Transport for BleTransport {
     // across recv() is safe: stop() drops BlePeripheralState first (closing conn_tx
     // via the peripheral task exiting), causing recv() to return None and accept()
     // to release the guard. stop() then acquires the lock to clear it.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     async fn accept(&self) -> Result<Box<dyn Connection>> {
         let mut guard = self.conn_rx.lock().await;
         match guard.as_mut() {
@@ -492,7 +730,7 @@ impl Transport for BleTransport {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     async fn accept(&self) -> Result<Box<dyn Connection>> {
         Err(PathweaveError::Transport(
             "BLE peripheral mode not supported on this platform".into(),
@@ -771,6 +1009,169 @@ impl BleTransport {
 }
 
 // --------------------------------------------------------------------------
+// macOS peripheral: start_peripheral (ADR 014, macOS section)
+// --------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+impl BleTransport {
+    async fn start_peripheral(&self, identity: &NodeIdentity) -> Result<()> {
+        use macos_delegate::MacosPeripheralDelegate;
+        use objc2::{AllocAnyThread, ClassType};
+        use objc2_core_bluetooth::{
+            CBAttributePermissions, CBCharacteristic, CBCharacteristicProperties,
+            CBMutableCharacteristic, CBMutableService, CBPeripheralManager, CBUUID,
+        };
+        use objc2_foundation::{NSMutableArray, NSString};
+
+        // short_id is not included in the macOS advertisement payload; CoreBluetooth
+        // silently ignores CBAdvertisementDataServiceDataKey. See ADR 014 macOS section.
+        let _ = identity;
+
+        let write_forward: Arc<
+            std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let (subscribe_tx, subscribe_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<BlePeripheralConnection>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let bridge = Arc::new(PeripheralDelegateBridge {
+            subscribe_tx,
+            write_forward: Arc::clone(&write_forward),
+        });
+
+        // All CoreBluetooth objects are not Send. We set everything up synchronously
+        // inside block_in_place, then extract raw pointers for the async task.
+        //
+        // Memory contract:
+        //   manager and notify_char are forgot (Retained leaked); the task releases
+        //   them on exit via Retained::from_raw.
+        //
+        //   delegate is NOT forgot: we let the Rust Retained drop at the end of this
+        //   block_in_place closure, taking the count from 2 to 1 (the manager holds
+        //   its own ObjC retain). When the manager is released in the task, the count
+        //   drops to 0 and the delegate is freed.
+        let (manager_ptr, notify_char_ptr) = tokio::task::block_in_place(|| {
+            let delegate = MacosPeripheralDelegate::new(Arc::clone(&bridge));
+
+            // Use a background serial queue so callbacks are not tied to the main
+            // run loop, which is not guaranteed to spin in a CLI/daemon process.
+            let queue = dispatch2::DispatchQueue::new(
+                "com.pathweave.ble.peripheral",
+                dispatch2::DispatchQueueAttr::SERIAL,
+            );
+
+            let manager = unsafe {
+                CBPeripheralManager::initWithDelegate_queue(
+                    CBPeripheralManager::alloc(),
+                    Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                )
+            };
+
+            let svc_uuid = unsafe {
+                CBUUID::UUIDWithString(&NSString::from_str(
+                    &PATHWEAVE_SERVICE_UUID.hyphenated().to_string(),
+                ))
+            };
+            let write_uuid = unsafe {
+                CBUUID::UUIDWithString(&NSString::from_str(
+                    &WRITE_CHAR_UUID.hyphenated().to_string(),
+                ))
+            };
+            let notify_uuid = unsafe {
+                CBUUID::UUIDWithString(&NSString::from_str(
+                    &NOTIFY_CHAR_UUID.hyphenated().to_string(),
+                ))
+            };
+
+            // Write characteristic: CBCharacteristicPropertyWrite (not WriteWithoutResponse).
+            // CoreBluetooth only delivers data to peripheralManager:didReceiveWriteRequests:
+            // for write-with-response. Write commands (without response) are silently
+            // dropped on macOS. The central detects the property and uses WithResponse.
+            let write_char = unsafe {
+                CBMutableCharacteristic::initWithType_properties_value_permissions(
+                    CBMutableCharacteristic::alloc(),
+                    &write_uuid,
+                    CBCharacteristicProperties::Write,
+                    None,
+                    CBAttributePermissions::Writeable,
+                )
+            };
+            let notify_char = unsafe {
+                CBMutableCharacteristic::initWithType_properties_value_permissions(
+                    CBMutableCharacteristic::alloc(),
+                    &notify_uuid,
+                    CBCharacteristicProperties::Notify,
+                    None,
+                    CBAttributePermissions::Readable,
+                )
+            };
+
+            // Use CBCharacteristic as the array element type so setCharacteristics
+            // accepts it without coercion (CBMutableCharacteristic: Deref<Target = CBCharacteristic>).
+            let chars = NSMutableArray::<CBCharacteristic>::new();
+            unsafe { chars.addObject(&write_char) };
+            unsafe { chars.addObject(&*notify_char) };
+
+            let service = unsafe {
+                CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true)
+            };
+            unsafe { service.setCharacteristics(Some(&chars)) };
+            unsafe { manager.addService(&service) };
+
+            // macOS only supports CBAdvertisementDataLocalNameKey and
+            // CBAdvertisementDataServiceUUIDsKey. Service data is silently ignored.
+            // See ADR 014 macOS section.
+            //
+            // We build the advertisement dictionary via msg_send! to avoid generic
+            // type parameter gymnastics (NSDictionary<K,V> coercions are not yet
+            // ergonomic for mixed-type dictionaries in objc2 0.6).
+            let uuid_arr = NSMutableArray::<CBUUID>::new();
+            unsafe { uuid_arr.addObject(&*svc_uuid) };
+            let adv_key = NSString::from_str("kCBAdvDataServiceUUIDs");
+            let adv: Option<
+                objc2::rc::Retained<
+                    objc2_foundation::NSDictionary<NSString, objc2::runtime::AnyObject>,
+                >,
+            > = unsafe {
+                objc2::msg_send_id![
+                    objc2_foundation::NSDictionary::<NSString, objc2::runtime::AnyObject>::class(),
+                    dictionaryWithObject: &*uuid_arr,
+                    forKey: &*adv_key
+                ]
+            };
+            unsafe { manager.startAdvertising(adv.as_deref()) };
+
+            let mgr_ptr = objc2::rc::Retained::as_ptr(&manager) as *mut CBPeripheralManager;
+            let notify_ptr =
+                objc2::rc::Retained::as_ptr(&notify_char) as *mut CBMutableCharacteristic;
+
+            std::mem::forget(manager);
+            std::mem::forget(notify_char);
+            // delegate drops here; manager holds its own ObjC retain on the delegate
+
+            (mgr_ptr, notify_ptr)
+        });
+
+        tokio::spawn(macos_peripheral_task(
+            SendPtr(manager_ptr),
+            SendPtr(notify_char_ptr),
+            conn_tx,
+            write_forward,
+            subscribe_rx,
+            stop_rx,
+        ));
+
+        *self.conn_rx.lock().await = Some(conn_rx);
+        *self.peripheral.lock().await = Some(BlePeripheralState {
+            _stop_signal: stop_tx,
+        });
+
+        Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------
 // Central-mode connection (btleplug)
 // --------------------------------------------------------------------------
 
@@ -786,8 +1187,20 @@ pub struct BleConnection {
 #[async_trait]
 impl Connection for BleConnection {
     async fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        // Linux/Windows peripherals expose WriteWithoutResponse; macOS peripherals
+        // expose only Write (with response) because CoreBluetooth does not deliver
+        // ATT write commands to peripheralManager:didReceiveWriteRequests:.
+        let write_type = if self
+            .write_char
+            .properties
+            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+        {
+            WriteType::WithoutResponse
+        } else {
+            WriteType::WithResponse
+        };
         self.peripheral
-            .write(&self.write_char, bytes, WriteType::WithoutResponse)
+            .write(&self.write_char, bytes, write_type)
             .await
             .map_err(|e| PathweaveError::Transport(e.to_string()))
     }
@@ -844,7 +1257,7 @@ mod tests {
         assert!(matches!(result, Err(PathweaveError::Transport(_))));
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     #[tokio::test]
     async fn accept_returns_not_supported_on_other_platforms() {
         let transport = BleTransport::new();
@@ -852,7 +1265,7 @@ mod tests {
         assert!(matches!(result, Err(PathweaveError::Transport(_))));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[tokio::test]
     async fn accept_before_start_returns_error() {
         let transport = BleTransport::new();
