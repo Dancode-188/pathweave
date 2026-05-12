@@ -168,9 +168,7 @@ fn uuid_to_guid(uuid: &Uuid) -> windows::core::GUID {
 }
 
 #[cfg(target_os = "windows")]
-fn bytes_to_ibuffer(
-    bytes: &[u8],
-) -> windows::core::Result<windows::Storage::Streams::IBuffer> {
+fn bytes_to_ibuffer(bytes: &[u8]) -> windows::core::Result<windows::Storage::Streams::IBuffer> {
     let writer = windows::Storage::Streams::DataWriter::new()?;
     writer.WriteBytes(bytes)?;
     writer.DetachBuffer()
@@ -618,8 +616,8 @@ impl BleTransport {
 impl BleTransport {
     async fn start_peripheral(&self, identity: &NodeIdentity) -> Result<()> {
         use windows::Devices::Bluetooth::GenericAttributeProfile::{
-            GattCharacteristicProperties, GattLocalCharacteristicParameters,
-            GattServiceProvider, GattServiceProviderAdvertisingParameters,
+            GattCharacteristicProperties, GattLocalCharacteristicParameters, GattServiceProvider,
+            GattServiceProviderAdvertisingParameters,
         };
         use windows::Foundation::TypedEventHandler;
         use windows::Storage::Streams::DataReader;
@@ -630,18 +628,15 @@ impl BleTransport {
             std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>,
         > = Arc::new(std::sync::Mutex::new(None));
         let (subscribe_tx, subscribe_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let (conn_tx, conn_rx) =
-            tokio::sync::mpsc::unbounded_channel::<BlePeripheralConnection>();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<BlePeripheralConnection>();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
         // IAsyncOperation<T> does not implement Future in windows crate 0.52+.
         // Use block_in_place (safe on multi-threaded tokio) with .get() for init calls.
-        let service_result =
-            tokio::task::block_in_place(|| {
-                GattServiceProvider::CreateAsync(uuid_to_guid(&PATHWEAVE_SERVICE_UUID))?
-                    .get()
-            })
-            .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        let service_result = tokio::task::block_in_place(|| {
+            GattServiceProvider::CreateAsync(uuid_to_guid(&PATHWEAVE_SERVICE_UUID))?.get()
+        })
+        .map_err(|e| PathweaveError::Transport(e.to_string()))?;
         let service_provider = service_result
             .ServiceProvider()
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
@@ -719,7 +714,9 @@ impl BleTransport {
                     windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic,
                 >,
                       _| {
-                    let Some(c) = char else { return Ok(()); };
+                    let Some(c) = char else {
+                        return Ok(());
+                    };
                     if c.SubscribedClients()?.Size()? > 0 {
                         let _ = subscribe_tx.send(());
                     }
