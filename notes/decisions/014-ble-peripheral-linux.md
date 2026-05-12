@@ -1,4 +1,4 @@
-# ADR 014: BLE peripheral mode: bluer on Linux, WinRT on Windows
+# ADR 014: BLE peripheral mode: bluer on Linux, WinRT on Windows, CoreBluetooth on macOS
 
 **Status:** Accepted
 
@@ -15,8 +15,8 @@ Three design questions remained open for Linux:
 2. How `accept()` maps onto bluer's event-driven model
 3. How `bluer` and `btleplug` coexist inside the same crate
 
-This ADR settles all three for Linux, and adds a Windows section covering the
-WinRT-based implementation via the `windows` crate (v0.58).
+This ADR settles all three for Linux and adds Windows (WinRT via the `windows` crate
+v0.58) and macOS (CoreBluetooth via `objc2-core-bluetooth` v0.3.2) sections.
 
 ## Linux: bluer v0.17 GATT server data API
 
@@ -107,26 +107,26 @@ CharacteristicNotify {
 acknowledgement. Delivery guarantees are provided by the at-least-once retry loop
 (ADR 011) at the application layer.
 
-### bluer/btleplug coexistence
+### Platform-specific coexistence
 
-`BleTransport` gains two fields shared by Linux and Windows:
+`BleTransport` gains two fields shared by all three peripheral platforms:
 
 ```rust
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 peripheral: Arc<tokio::sync::Mutex<Option<BlePeripheralState>>>,
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 conn_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlePeripheralConnection>>>,
 ```
 
 All bluer types are gated under `#[cfg(target_os = "linux")]`; all WinRT types under
-`#[cfg(target_os = "windows")]`. The btleplug central-mode field
+`#[cfg(target_os = "windows")]`; all CoreBluetooth types under
+`#[cfg(target_os = "macos")]`. The btleplug central-mode field
 (`adapter: Arc<Mutex<Option<Adapter>>>`) is unchanged and platform-independent. On
-macOS, neither `bluer` nor `windows` is in the dependency tree and `accept()` returns
-the not-implemented error.
+other platforms, `accept()` returns the not-implemented error.
 
-`pathweave-transport-ble/Cargo.toml` adds a
-`[target.'cfg(target_os = "linux")'.dependencies]` section with
-`bluer = { workspace = true }`.
+`pathweave-transport-ble/Cargo.toml` has three platform-specific dependency sections:
+`bluer = { workspace = true }` for Linux; `windows` crate v0.58 for Windows;
+`objc2-core-bluetooth` v0.3.2 with companion crates for macOS.
 
 ### Handle lifetime and peripheral state
 
@@ -200,8 +200,8 @@ correctly with this layout.
 8. Store `conn_rx` in `self.conn_rx`, then store
    `BlePeripheralState { _adv_handle, _app_handle }` in `self.peripheral`.
 
-On non-Linux platforms, `start()` uses `_identity` and performs the existing
-btleplug adapter initialization unchanged.
+On macOS, `start()` calls a CoreBluetooth-based `start_peripheral`. On other platforms,
+`start()` uses `_identity` and performs only the existing btleplug adapter initialization.
 
 ### peripheral_loop
 
@@ -295,12 +295,12 @@ write events from the same subscriber. Reply bytes flow from connections through
 
 ### accept()
 
-The `accept()` implementation is shared between Linux and Windows. The
+The `accept()` implementation is shared across all three peripheral platforms. The
 platform-specific difference is only in what causes `recv()` to return `None` (bluer
-handle drop vs. stop signal drop), not in the `accept()` body itself.
+handle drop on Linux; stop signal drop on Windows and macOS), not in the body itself.
 
 ```rust
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 async fn accept(&self) -> Result<Box<dyn Connection>> {
     let mut guard = self.conn_rx.lock().await;
     match guard.as_mut() {
@@ -405,14 +405,14 @@ releases the `conn_rx` guard. `stop()` then acquires `self.conn_rx` and clears i
 ### BlePeripheralConnection
 
 ```rust
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 struct BlePeripheralConnection {
     write_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
     reply_tx:  tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 ```
 
-`BlePeripheralConnection` is platform-independent. Both Linux and Windows wire their
+`BlePeripheralConnection` is platform-independent. All three platforms wire their
 platform-specific events into these channels and hand the connection to `accept()`.
 `Session::respond()` then drives the Noise_XX handshake over `recv_bytes`/`send_bytes`
 without knowing what is underneath.
@@ -431,6 +431,102 @@ drops `write_rx` and the cloned `reply_tx`. `peripheral_loop` detects the droppe
 receiver when `active_write_tx.send()` fails and clears the active connection state.
 
 `mtu()` returns 512, consistent with `BleConnection` and ADR 002's GATT MTU.
+
+### Transport::start() on macOS
+
+`BleTransport::start_peripheral(&identity)` on macOS executes the following sequence:
+
+1. Create a background serial `dispatch2::Queue` for CoreBluetooth callbacks.
+2. Instantiate `MacosPeripheralDelegate` with an `Arc<PeripheralDelegateBridge>`.
+3. Allocate `CBPeripheralManager::initWithDelegate:queue:` with the delegate and queue.
+4. Create `CBUUID` instances from the three service/characteristic UUIDs via
+   `CBUUID::UUIDWithString`.
+5. Create `CBMutableCharacteristic` for write (`CBCharacteristicPropertyWrite`) and
+   notify (`CBCharacteristicPropertyNotify`). Note: `WriteWithoutResponse` is NOT used;
+   see rationale below.
+6. Create `CBMutableService`, add both characteristics, call `manager.addService`.
+7. Build the advertisement dictionary with `CBAdvertisementDataServiceUUIDsKey` and
+   call `manager.startAdvertising`. Service data is not included; see rationale.
+8. Create channels: unbounded `(conn_tx, conn_rx)`, unbounded `(subscribe_tx, subscribe_rx)`,
+   oneshot `(stop_tx, stop_rx)`.
+9. `std::mem::forget` the manager and notify characteristic (raw pointers pass to task).
+   The delegate is NOT forgotten: letting its Rust `Retained<>` drop reduces the ObjC
+   retain count from 2 to 1 (the manager holds its own ObjC retain).
+10. Spawn `macos_peripheral_task(manager_ptr, notify_char_ptr, conn_tx, write_forward,
+    subscribe_rx, stop_rx)`.
+11. Store `conn_rx` and `BlePeripheralState { _stop_signal: stop_tx }`.
+
+### MacosPeripheralDelegate
+
+`MacosPeripheralDelegate` is an Objective-C class declared with `objc2::declare_class!`
+that implements `CBPeripheralManagerDelegate`. It uses `objc2::mutability::Mutable`
+(not `MainThreadOnly`) so it can be allocated and freed from background threads.
+
+Its ivars hold an `Arc<PeripheralDelegateBridge>`:
+
+```rust
+pub struct Ivars {
+    pub bridge: Arc<PeripheralDelegateBridge>,
+}
+```
+
+Initialization uses the `set_ivars` + `msg_send_id![super(this), init]` pattern
+required by `objc2::DeclaredClass`:
+
+```rust
+pub fn new(bridge: Arc<PeripheralDelegateBridge>) -> Retained<Self> {
+    let this = Self::alloc();
+    let this = this.set_ivars(Ivars { bridge });
+    unsafe { msg_send_id![super(this), init] }
+}
+```
+
+Relevant delegate methods:
+
+- `peripheralManagerDidUpdateState:`: logs the new state.
+- `peripheralManager:central:didSubscribeToCharacteristic:`: sends `()` to
+  `subscribe_tx`, signaling `macos_peripheral_task` to create a new connection.
+- `peripheralManager:didReceiveWriteRequests:`: reads each request's value bytes,
+  forwards them to the active connection via `write_forward`, then calls
+  `respondToRequest:withResult:` with `CBATTError::Success`. Responding is required
+  because the write characteristic uses `CBCharacteristicPropertyWrite`.
+
+### macos_peripheral_task
+
+Structure mirrors `windows_peripheral_task`: an outer loop waiting for a subscriber
+or stop signal, and an inner loop forwarding replies. Notifications are sent via
+`CBPeripheralManager::updateValue:forCharacteristic:onSubscribedCentrals:` wrapped in
+`block_in_place` (synchronous, runs on a tokio worker thread). On task exit, the
+leaked `Retained<>` objects are reconstructed from raw pointers via `Retained::from_raw`
+and dropped, releasing the ObjC objects:
+
+```rust
+// Release the leaked ObjC objects on task exit
+unsafe {
+    let _ = Retained::from_raw(notify_char_ptr);
+    let _ = Retained::from_raw(manager_ptr);
+}
+```
+
+When the manager is freed, its `dealloc` releases the service, characteristics, and
+the delegate property (reducing the delegate's retain count from 1 to 0, which frees
+the delegate and drops its Rust ivars including the `Arc<PeripheralDelegateBridge>`).
+
+### Central-side adaptation: BleConnection::send_bytes
+
+```rust
+let write_type =
+    if self.write_char.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+        WriteType::WithoutResponse
+    } else {
+        WriteType::WithResponse
+    };
+```
+
+Linux and Windows peripherals expose `WRITE_WITHOUT_RESPONSE`; macOS exposes only
+`WRITE`. `BleConnection` detects this from the discovered characteristic properties
+and uses the appropriate write type automatically. No protocol-level changes are
+needed: the Noise_XX handshake is transport-agnostic.
 
 ### NodeIdentity propagation chain
 
@@ -573,27 +669,95 @@ The `_stop_signal` oneshot avoids all of this. When dropped (in `stop()`), it fi
 the `stop_rx => break 'outer` select arm in `windows_peripheral_task`, which exits
 cleanly and drops `conn_tx` from within the tokio runtime.
 
+**Why CBCharacteristicPropertyWrite (not WriteWithoutResponse) on macOS?**
+
+CoreBluetooth's `CBPeripheralManager` does not deliver ATT Write Commands (write
+without response, opcode 0x52) to the `peripheralManager:didReceiveWriteRequests:`
+delegate method. That callback is only invoked for ATT Write Requests (write with
+response, opcode 0x12). A characteristic configured with only
+`CBCharacteristicPropertyWriteWithoutResponse` would receive no data at all from
+centrals. Using `CBCharacteristicPropertyWrite` ensures the delegate callback is
+invoked and the peripheral can receive frames.
+
+The consequence is that the central must use `WriteType::WithResponse` for macOS
+peripherals, adding one ATT acknowledgement round-trip per write. For a mesh network
+in opportunistic range, this latency is acceptable and does not affect correctness.
+
+**Why is service data not included in the macOS advertisement?**
+
+CoreBluetooth silently ignores `CBAdvertisementDataServiceDataKey` in the dictionary
+passed to `startAdvertising`. Only `CBAdvertisementDataLocalNameKey` and
+`CBAdvertisementDataServiceUUIDsKey` are honored. This is a documented platform
+restriction on iOS and macOS.
+
+The consequence: macOS peripherals cannot include `short_id` in their advertisement.
+The central sees a `CentralEvent::ServicesAdvertisement` (service UUID only, no service
+data) rather than `CentralEvent::ServiceDataAdvertisement`. `discover()` handles both
+variants: `ServicesAdvertisement` yields an announcement with `short_id: None`.
+`short_id` is pre-authentication metadata only; Noise_XX provides full peer identity
+during the handshake regardless.
+
+**Why std::mem::forget for manager and notify_char?**
+
+`CBPeripheralManager` and `CBMutableCharacteristic` are not `Send`. They cannot be
+moved into the async task. `std::mem::forget` leaks the Rust `Retained<>` objects (ObjC
+retain count remains at the leaked-in count) and raw pointers are passed to the task
+inside `unsafe impl Send` newtypes. The task reconstructs `Retained<>` from the raw
+pointers via `Retained::from_raw` on exit, taking ownership of the leaked retain count.
+When the `Retained<>` drops, it releases the ObjC object.
+
+The delegate is not leaked: the manager acquires its own ObjC retain on the delegate
+during `initWithDelegate:queue:`. Dropping the Rust `Retained<delegate>` at the end of
+the setup closure reduces the count from 2 to 1 without freeing the object. When the
+manager is later freed (via `Retained::from_raw(manager_ptr)` in the task), the
+manager's retain on the delegate is released (1 to 0), triggering the delegate's
+dealloc and dropping its Rust ivars.
+
+**Why Mutable (not MainThreadOnly) for MacosPeripheralDelegate?**
+
+`MainThreadOnly` types in objc2 require the main thread marker for allocation. This
+delegate is created in a `block_in_place` closure on a tokio worker thread, not on
+the main thread. Using `Mutable` removes this restriction. CoreBluetooth delivers
+delegate callbacks on the queue passed to `initWithDelegate:queue:` (a background
+serial queue in our case), not the main thread, so `MainThreadOnly` semantics are
+incorrect for this class.
+
+**Why a background serial queue, not the main queue?**
+
+`CBPeripheralManager` requires a dispatch queue for callback delivery. Passing `nil`
+defaults to the main queue, but the main thread in a CLI/daemon process may not have
+a running AppKit run loop, which can cause CoreBluetooth state machine stalls. A
+dedicated background serial queue (`dispatch2::Queue::new(...)`) ensures callbacks
+are delivered reliably regardless of the main thread's state.
+
 ## Implications
 
-- `bluer` is added as a `[target.'cfg(target_os = "linux")'.dependencies]` entry
-  in `pathweave-transport-ble/Cargo.toml`.
+- `bluer` is added as a `[target.'cfg(target_os = "linux")'.dependencies]` entry.
 - `windows` crate v0.58 is added as a `[target.'cfg(target_os = "windows")'.dependencies]`
   entry with features: `Devices_Bluetooth`, `Devices_Bluetooth_GenericAttributeProfile`,
   `Foundation`, `Foundation_Collections`, `Storage_Streams`.
-- `BlePeripheralConnection` is shared across Linux and Windows under
-  `#[cfg(any(target_os = "linux", target_os = "windows"))]`.
-- `BleTransport` gains `peripheral` and `conn_rx` fields under
-  `#[cfg(any(target_os = "linux", target_os = "windows"))]`.
-- `BlePeripheralState` is platform-specific: on Linux it holds RAII handles; on
-  Windows it holds `_stop_signal`.
+- `objc2-core-bluetooth` v0.3.2, `objc2` v0.6, `objc2-foundation` v0.3, and `dispatch2`
+  v0.3 are added as `[target.'cfg(target_os = "macos")'.dependencies]` entries.
+- `BlePeripheralConnection` is shared across all three platforms under
+  `#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]`.
+- `BleTransport` gains `peripheral` and `conn_rx` fields under the same cfg.
+- `BlePeripheralState` is platform-specific: RAII handles on Linux; `_stop_signal`
+  on Windows and macOS.
 - `Transport::start()` signature changes to `start(&self, identity: &NodeIdentity)`.
 - `QuicTransport`, all mock transports in tests: add `_identity`.
 - `health_monitor()`, `Router::register_transport()`, `PathweaveNode::add_transport()`:
   propagate `Arc<NodeIdentity>` as described above.
-- `accept()` is a single implementation under `any(linux, windows)`. On other
-  platforms it returns the not-implemented error unchanged.
+- `accept()` is a single implementation under `any(linux, windows, macos)`. On other
+  platforms it returns the not-implemented error.
+- `BleConnection::send_bytes` checks `CharPropFlags::WRITE_WITHOUT_RESPONSE` to select
+  the write type. Linux/Windows peripherals use `WithoutResponse`; macOS uses `WithResponse`.
+- `discover()` handles both `ServiceDataAdvertisement` (Linux/Windows) and
+  `ServicesAdvertisement` (macOS/iOS) events in the scan loop.
 - Multiple simultaneous centrals are not supported in v0.2.0. A second subscriber
-  while a connection is active is dropped with a debug log on both platforms.
+  while a connection is active is dropped with a debug log on all platforms.
 - Windows peripheral mode requires Windows 10 version 1903 (Build 18362) or later
   for `SetServiceData` via `IGattServiceProviderAdvertisingParameters2`.
-- macOS peripheral mode remains deferred per ADR 006.
+- macOS peripheral mode requires macOS 10.9+ (CoreBluetooth peripheral role support).
+- The macOS implementation has not been compiled on macOS hardware in this branch;
+  API surface (objc2-core-bluetooth method names, NSArray/NSDictionary construction)
+  may require minor adjustments when first built on a Mac.

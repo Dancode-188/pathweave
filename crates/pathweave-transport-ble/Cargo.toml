@@ -30,5 +30,28 @@ windows = { version = "0.58", features = [
     "Storage_Streams",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-bluetooth = { version = "0.3.2", features = [
+    "CBManager",
+    "CBPeripheralManager",
+    "CBCharacteristic",
+    "CBService",
+    "CBUUID",
+    "CBATTRequest",
+    "CBCentral",
+    "CBPeer",
+    "CBAdvertisementData",
+    "dispatch2",
+] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "alloc",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSString",
+] }
+dispatch2 = "0.3"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

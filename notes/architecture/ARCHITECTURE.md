@@ -48,7 +48,7 @@ implementing one trait. It doesn't touch anything else.
 |---|---|
 | `pathweave-core` | Transport trait, PathweaveNode, Router, Session layer, Bundle layer |
 | `pathweave-transport-quic` | QUIC implementation of Transport |
-| `pathweave-transport-ble` | BLE implementation of Transport. btleplug for central mode (scanning, GATT); bluer for peripheral mode (advertising) on Linux; native platform APIs on mobile. |
+| `pathweave-transport-ble` | BLE implementation of Transport. btleplug for central mode (scanning, GATT); bluer on Linux, WinRT on Windows, CoreBluetooth on macOS for peripheral mode (advertising). Native platform APIs for mobile. |
 | `pathweave-uniffi` | FFI bindings layer. Exposes PathweaveNode to Swift and Kotlin. |
 | `pw-chat` (example) | Terminal chat demo. The v0.1.0 launch artifact. |
 
@@ -467,9 +467,11 @@ Peripheral mode: platform-specific.
 - Android and iOS: the platform's native BLE APIs called through the UniFFI layer.
   CoreBluetooth on iOS, BluetoothManager on Android. The `pathweave-transport-ble`
   Rust crate is not used for peripheral mode on mobile; the native layer handles it.
-- macOS: not yet implemented. CoreBluetooth is available on macOS (same framework as
-  iOS); the implementation will be compile-tested on CI with community hardware testing.
-  Tracked in issue #52.
+- macOS: `objc2-core-bluetooth` v0.3.2 via `objc2` bindings, shipped in v0.2.0.
+  CoreBluetooth's `CBPeripheralManager` with `CBCharacteristicPropertyWrite` (not
+  WriteWithoutResponse; the platform does not deliver write commands to the delegate).
+  Advertisement includes service UUID only; service data is silently ignored by macOS.
+  See ADR 014.
 - Windows: `windows` crate v0.58, shipped in v0.2.0. WinRT GATT Server API
   (`Windows.Devices.Bluetooth.GenericAttributeProfile`). See ADR 014.
 
@@ -531,8 +533,8 @@ When neither transport can reach the peer: "message failed: no transport availab
 No queuing, no silent retry.
 
 BLE in pw-chat works when at least one peer can advertise. Supported configurations:
-two Linux machines, a Linux or Windows machine and a macOS machine (pending issue
-#52), or any of the above and a phone running the native SDK.
+two Linux machines, a Linux or Windows machine and a macOS machine, or any combination
+with a phone running the native SDK.
 
 ---
 
@@ -548,7 +550,7 @@ Being clear about this matters as much as being clear about what it does.
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
 - No WiFi vs. mobile data detection for QUIC cost reporting (v0.2.0 cost intelligence
   work not yet complete; all QUIC connections currently report Metered)
-- No BLE peripheral mode on macOS yet (in progress, issue #52)
+- macOS BLE peripheral mode compiled from Windows; needs hardware verification on macOS
 - No security audit completed
 
 v1.0.0 means the API is stable and the library is ready for production use. We're
