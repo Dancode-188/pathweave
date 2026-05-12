@@ -292,7 +292,7 @@ struct PeripheralDelegateBridge {
 mod macos_delegate {
     use super::*;
     use objc2::rc::Retained;
-    use objc2::{declare_class, msg_send_id, ClassType, DeclaredClass};
+    use objc2::{define_class, msg_send_id, ClassType, DefinedClass};
     use objc2_core_bluetooth::{
         CBATTError, CBCentral, CBCharacteristic, CBPeripheralManager, CBPeripheralManagerDelegate,
     };
@@ -302,7 +302,7 @@ mod macos_delegate {
         pub bridge: Arc<super::PeripheralDelegateBridge>,
     }
 
-    declare_class!(
+    define_class!(
         pub struct MacosPeripheralDelegate;
 
         unsafe impl ClassType for MacosPeripheralDelegate {
@@ -313,7 +313,7 @@ mod macos_delegate {
             const NAME: &'static str = "PathweaveMacosPeripheralDelegate";
         }
 
-        impl DeclaredClass for MacosPeripheralDelegate {
+        impl DefinedClass for MacosPeripheralDelegate {
             type Ivars = Ivars;
         }
 
@@ -619,15 +619,15 @@ impl Transport for BleTransport {
                     // ServicesAdvertisement (they cannot set service data). Both events
                     // firing for the same device in a Pathweave scan is not a realistic
                     // scenario.
-                    CentralEvent::ServicesAdvertisement { id, services } => {
-                        if services.contains(&PATHWEAVE_SERVICE_UUID) {
-                            let announcement = PeerAnnouncement {
-                                address: PeerAddress::Ble(id.to_string()),
-                                short_id: None,
-                            };
-                            if tx.unbounded_send(announcement).is_err() {
-                                break;
-                            }
+                    CentralEvent::ServicesAdvertisement { id, services }
+                        if services.contains(&PATHWEAVE_SERVICE_UUID) =>
+                    {
+                        let announcement = PeerAnnouncement {
+                            address: PeerAddress::Ble(id.to_string()),
+                            short_id: None,
+                        };
+                        if tx.unbounded_send(announcement).is_err() {
+                            break;
                         }
                     }
                     _ => {}
