@@ -292,7 +292,7 @@ struct PeripheralDelegateBridge {
 mod macos_delegate {
     use super::*;
     use objc2::rc::Retained;
-    use objc2::{define_class, msg_send, DefinedClass};
+    use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
     use objc2_core_bluetooth::{
         CBATTError, CBCentral, CBCharacteristic, CBPeripheralManager, CBPeripheralManagerDelegate,
     };
@@ -318,8 +318,7 @@ mod macos_delegate {
             fn did_update_state(&self, manager: &CBPeripheralManager) {
                 tracing::debug!("CBPeripheralManager state changed: {:?}", unsafe {
                     manager.state()
-                }
-                    as u64);
+                });
             }
 
             #[unsafe(method(peripheralManager:central:didSubscribeToCharacteristic:))]
@@ -343,7 +342,7 @@ mod macos_delegate {
             ) {
                 for req in unsafe { requests.iter() } {
                     if let Some(data) = unsafe { req.value() } {
-                        let bytes = Bytes::copy_from_slice(unsafe { data.as_bytes() });
+                        let bytes = Bytes::copy_from_slice(unsafe { data.as_bytes_unchecked() });
                         if let Ok(guard) = self.ivars().bridge.write_forward.lock() {
                             if let Some(tx) = guard.as_ref() {
                                 let _ = tx.send(bytes);
@@ -356,7 +355,7 @@ mod macos_delegate {
                     }
                 }
                 // Respond to the first request; CoreBluetooth applies it to the batch.
-                if let Some(first) = unsafe { requests.first() } {
+                if let Some(first) = unsafe { requests.firstObject_unchecked() } {
                     unsafe { manager.respondToRequest_withResult(first, CBATTError::Success) };
                 }
             }
@@ -374,29 +373,32 @@ mod macos_delegate {
     }
 }
 
+// SendPtr<T>: raw pointer wrapper that is Send. CBPeripheralManager and
+// CBMutableCharacteristic are not Send on their own; wrapping them here lets
+// macos_peripheral_task's future be Send so tokio::spawn accepts it.
+#[cfg(target_os = "macos")]
+struct SendPtr<T>(*mut T);
+#[cfg(target_os = "macos")]
+unsafe impl<T> Send for SendPtr<T> {}
+
 // macos_peripheral_task: macOS equivalent of peripheral_loop / windows_peripheral_task.
 //
-// Raw pointers to CBPeripheralManager and CBMutableCharacteristic are passed here
-// because those types are not Send. start_peripheral leaks the Retained<> objects
-// before spawning this task; this task reconstructs them from raw pointers (via
+// CBPeripheralManager and CBMutableCharacteristic are passed as SendPtr<T> because
+// those ObjC types are not Send. start_peripheral leaks the Retained<> objects before
+// spawning this task; this task reconstructs them from raw pointers (via
 // Retained::from_raw) on exit, releasing the ObjC objects. The delegate is not leaked:
 // the manager holds its own ObjC retain, so the Rust Retained<delegate> is allowed to
 // drop at the end of start_peripheral, reducing the count from 2 to 1. When the manager
 // is released here, the count goes from 1 to 0 and the delegate is freed.
 #[cfg(target_os = "macos")]
 async fn macos_peripheral_task(
-    manager_ptr: *mut objc2_core_bluetooth::CBPeripheralManager,
-    notify_char_ptr: *mut objc2_core_bluetooth::CBMutableCharacteristic,
+    manager: SendPtr<objc2_core_bluetooth::CBPeripheralManager>,
+    notify_char: SendPtr<objc2_core_bluetooth::CBMutableCharacteristic>,
     conn_tx: tokio::sync::mpsc::UnboundedSender<BlePeripheralConnection>,
     write_forward: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
     mut subscribe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    struct SendPtr<T>(*mut T);
-    unsafe impl<T> Send for SendPtr<T> {}
-
-    let manager = SendPtr(manager_ptr);
-    let notify_char = SendPtr(notify_char_ptr);
 
     'outer: loop {
         tokio::select! {
@@ -1015,6 +1017,7 @@ impl BleTransport {
 impl BleTransport {
     async fn start_peripheral(&self, identity: &NodeIdentity) -> Result<()> {
         use macos_delegate::MacosPeripheralDelegate;
+        use objc2::{AllocAnyThread, ClassType};
         use objc2_core_bluetooth::{
             CBAttributePermissions, CBCharacteristic, CBCharacteristicProperties,
             CBMutableCharacteristic, CBMutableService, CBPeripheralManager, CBUUID,
@@ -1053,15 +1056,15 @@ impl BleTransport {
 
             // Use a background serial queue so callbacks are not tied to the main
             // run loop, which is not guaranteed to spin in a CLI/daemon process.
-            let queue = dispatch2::Queue::new(
+            let queue = dispatch2::DispatchQueue::new(
                 "com.pathweave.ble.peripheral",
-                dispatch2::QueueAttribute::Serial,
+                dispatch2::DispatchQueueAttr::SERIAL,
             );
 
             let manager = unsafe {
                 CBPeripheralManager::initWithDelegate_queue(
                     CBPeripheralManager::alloc(),
-                    Some(&*delegate),
+                    Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)),
                     Some(&queue),
                 )
             };
@@ -1124,8 +1127,8 @@ impl BleTransport {
             // We build the advertisement dictionary via msg_send! to avoid generic
             // type parameter gymnastics (NSDictionary<K,V> coercions are not yet
             // ergonomic for mixed-type dictionaries in objc2 0.6).
-            let uuid_arr = NSMutableArray::new();
-            unsafe { uuid_arr.addObject(&svc_uuid) };
+            let uuid_arr = NSMutableArray::<CBUUID>::new();
+            unsafe { uuid_arr.addObject(&*svc_uuid) };
             let adv_key = NSString::from_str("kCBAdvDataServiceUUIDs");
             let adv: Option<
                 objc2::rc::Retained<
@@ -1152,8 +1155,8 @@ impl BleTransport {
         });
 
         tokio::spawn(macos_peripheral_task(
-            manager_ptr,
-            notify_char_ptr,
+            SendPtr(manager_ptr),
+            SendPtr(notify_char_ptr),
             conn_tx,
             write_forward,
             subscribe_rx,
