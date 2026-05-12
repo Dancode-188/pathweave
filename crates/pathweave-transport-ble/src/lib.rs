@@ -292,7 +292,7 @@ struct PeripheralDelegateBridge {
 mod macos_delegate {
     use super::*;
     use objc2::rc::Retained;
-    use objc2::{define_class, msg_send_id, ClassType, DefinedClass};
+    use objc2::{define_class, msg_send, DefinedClass};
     use objc2_core_bluetooth::{
         CBATTError, CBCentral, CBCharacteristic, CBPeripheralManager, CBPeripheralManagerDelegate,
     };
@@ -303,32 +303,26 @@ mod macos_delegate {
     }
 
     define_class!(
+        // No thread_kind attribute: the default allows use from any thread.
+        // MainThreadOnly would require a main thread token at allocation time,
+        // which is unavailable on a tokio worker thread or dispatch queue thread.
+        #[unsafe(super(NSObject))]
+        #[name = "PathweaveMacosPeripheralDelegate"]
+        #[ivars = Ivars]
         pub struct MacosPeripheralDelegate;
-
-        unsafe impl ClassType for MacosPeripheralDelegate {
-            type Super = NSObject;
-            // Mutable (not MainThreadOnly): the delegate is called on a background
-            // dispatch queue and must be usable from non-main threads.
-            type Mutability = objc2::mutability::Mutable;
-            const NAME: &'static str = "PathweaveMacosPeripheralDelegate";
-        }
-
-        impl DefinedClass for MacosPeripheralDelegate {
-            type Ivars = Ivars;
-        }
 
         unsafe impl NSObjectProtocol for MacosPeripheralDelegate {}
 
         unsafe impl CBPeripheralManagerDelegate for MacosPeripheralDelegate {
-            #[method(peripheralManagerDidUpdateState:)]
+            #[unsafe(method(peripheralManagerDidUpdateState:))]
             fn did_update_state(&self, manager: &CBPeripheralManager) {
-                tracing::debug!(
-                    "CBPeripheralManager state changed: {:?}",
-                    unsafe { manager.state() } as u64
-                );
+                tracing::debug!("CBPeripheralManager state changed: {:?}", unsafe {
+                    manager.state()
+                }
+                    as u64);
             }
 
-            #[method(peripheralManager:central:didSubscribeToCharacteristic:)]
+            #[unsafe(method(peripheralManager:central:didSubscribeToCharacteristic:))]
             fn did_subscribe(
                 &self,
                 _manager: &CBPeripheralManager,
@@ -341,7 +335,7 @@ mod macos_delegate {
             // Called only for CBCharacteristicPropertyWrite (write with response).
             // Must call respondToRequest:withResult: for every request.
             // WriteWithoutResponse commands are NOT delivered here.
-            #[method(peripheralManager:didReceiveWriteRequests:)]
+            #[unsafe(method(peripheralManager:didReceiveWriteRequests:))]
             fn did_receive_writes(
                 &self,
                 manager: &CBPeripheralManager,
@@ -372,10 +366,10 @@ mod macos_delegate {
     impl MacosPeripheralDelegate {
         pub fn new(bridge: Arc<super::PeripheralDelegateBridge>) -> Retained<Self> {
             // set_ivars writes the Rust ivars into the allocated object memory before
-            // calling NSObject's init, which is required by objc2's DeclaredClass contract.
+            // calling NSObject's init, required by objc2's DefinedClass contract.
             let this = Self::alloc();
             let this = this.set_ivars(Ivars { bridge });
-            unsafe { msg_send_id![super(this), init] }
+            unsafe { msg_send![super(this), init] }
         }
     }
 }
