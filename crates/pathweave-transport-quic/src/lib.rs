@@ -128,9 +128,7 @@ fn detect_network_cost() -> TransportCost {
         {
             TransportCost::Free
         }
-        Some(n)
-            if n.starts_with("wwan") || n.starts_with("rmnet") || n.starts_with("ppp") =>
-        {
+        Some(n) if n.starts_with("wwan") || n.starts_with("rmnet") || n.starts_with("ppp") => {
             TransportCost::Metered
         }
         _ => TransportCost::Unknown,
