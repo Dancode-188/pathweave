@@ -233,11 +233,12 @@ pub enum TransportCost {
 ```
 
 `Metered` covers two situations that are not the same: QUIC over WiFi (flat monthly fee,
-functionally free) and QUIC over mobile data (per-megabyte, genuinely metered). Detecting
-which one you're on requires platform-specific OS APIs. Currently, all QUIC connections
-report `Metered` as the conservative default. The v0.2.0 cost intelligence work will
-replace this with WiFi vs. mobile data detection. Battery level, signal quality, and
-payload-size routing are deferred beyond v0.2.0.
+functionally free) and QUIC over mobile data (per-megabyte, genuinely metered). Detection
+uses platform-specific OS APIs: `/proc/net/route` + interface name heuristics on Linux,
+`NetworkInformation::GetConnectionCost()` on Windows, and `SCNetworkInterfaceType` via
+the SystemConfiguration framework on macOS. The detected cost is cached at `start()` time
+and refreshed by `health_monitor` on every network topology change (ADR 015). Battery
+level, signal quality, and payload-size routing are deferred beyond v0.2.0.
 
 ---
 
@@ -548,8 +549,8 @@ Being clear about this matters as much as being clear about what it does.
 - No contact or key registry (Noise_XK upgrade deferred to v0.3.0)
 - No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
-- No WiFi vs. mobile data detection for QUIC cost reporting (v0.2.0 cost intelligence
-  work not yet complete; all QUIC connections currently report Metered)
+- No real-time cost change notifications via OS events (health_monitor restart provides
+  cost refresh on topology change; OS event integration deferred to v0.3.0)
 - macOS BLE peripheral mode compiled from Windows; needs hardware verification on macOS
 - No security audit completed
 
