@@ -20,5 +20,12 @@ rcgen = { workspace = true }
 mdns-sd = { workspace = true }
 getrandom = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Networking_Connectivity"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+if-addrs = { workspace = true }
+system-configuration = "0.7"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

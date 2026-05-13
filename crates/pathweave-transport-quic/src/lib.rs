@@ -1,6 +1,9 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use async_trait::async_trait;
@@ -46,6 +49,8 @@ pub struct QuicTransport {
     endpoint: Mutex<Option<Endpoint>>,
     mdns: std::sync::Mutex<Option<MdnsState>>,
     instance_name: String,
+    // Detected at start() time; read lock-free by cost(). Encoding: 0=Free, 1=Metered, 2=Unknown.
+    cost: AtomicU8,
 }
 
 impl QuicTransport {
@@ -58,6 +63,7 @@ impl QuicTransport {
             endpoint: Mutex::new(None),
             mdns: std::sync::Mutex::new(None),
             instance_name,
+            cost: AtomicU8::new(2), // Unknown until start() detects the interface type
         }
     }
 
@@ -85,6 +91,119 @@ fn local_ipv4() -> Ipv4Addr {
             }
         })
         .unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
+// --------------------------------------------------------------------------
+// Network cost detection (ADR 015)
+// --------------------------------------------------------------------------
+
+// Linux: parse /proc/net/route to find the default-route interface, then
+// classify by interface name prefix. No new dependencies required.
+#[cfg(target_os = "linux")]
+fn detect_network_cost() -> TransportCost {
+    let content = match std::fs::read_to_string("/proc/net/route") {
+        Ok(c) => c,
+        Err(_) => return TransportCost::Unknown,
+    };
+    let iface = content.lines().skip(1).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let iface = fields.next()?;
+        let dest = fields.next()?;
+        if dest == "00000000" {
+            Some(iface.to_string())
+        } else {
+            None
+        }
+    });
+    match iface.as_deref() {
+        Some(n) if n.starts_with("wlan") || n.starts_with("wlp") || n.starts_with("wlx") => {
+            TransportCost::Free
+        }
+        Some(n)
+            if n.starts_with("eth")
+                || n.starts_with("enp")
+                || n.starts_with("eno")
+                || n.starts_with("ens")
+                || n.starts_with("enx") =>
+        {
+            TransportCost::Free
+        }
+        Some(n)
+            if n.starts_with("wwan") || n.starts_with("rmnet") || n.starts_with("ppp") =>
+        {
+            TransportCost::Metered
+        }
+        _ => TransportCost::Unknown,
+    }
+}
+
+// Windows: ask the OS directly via WinRT NetworkInformation. Unrestricted maps
+// to Free; Fixed and Variable are metered plans with data caps.
+#[cfg(target_os = "windows")]
+fn detect_network_cost() -> TransportCost {
+    use windows::Networking::Connectivity::{NetworkCostType, NetworkInformation};
+    let result = (|| -> windows::core::Result<TransportCost> {
+        let profile = NetworkInformation::GetInternetConnectionProfile()?;
+        let cost_type = profile.GetConnectionCost()?.NetworkCostType()?;
+        if cost_type == NetworkCostType::Unrestricted {
+            Ok(TransportCost::Free)
+        } else if cost_type == NetworkCostType::Unknown {
+            Ok(TransportCost::Unknown)
+        } else {
+            Ok(TransportCost::Metered)
+        }
+    })();
+    result.unwrap_or(TransportCost::Unknown)
+}
+
+// macOS: match active interface BSD names (from if_addrs) against the
+// SystemConfiguration interface list to get the interface type. Free wins
+// over Metered if multiple active interfaces are found.
+#[cfg(target_os = "macos")]
+fn detect_network_cost() -> TransportCost {
+    use std::collections::HashSet;
+    use system_configuration::network_configuration::{get_interfaces, SCNetworkInterfaceType};
+
+    let active: HashSet<String> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .map(|i| i.name)
+        .collect();
+
+    let mut found_free = false;
+    let mut found_metered = false;
+
+    for iface in get_interfaces().iter() {
+        let Some(bsd) = iface.bsd_name() else {
+            continue;
+        };
+        if !active.contains(bsd.to_string().as_str()) {
+            continue;
+        }
+        match iface.interface_type() {
+            Some(SCNetworkInterfaceType::IEEE80211) | Some(SCNetworkInterfaceType::Ethernet) => {
+                found_free = true;
+            }
+            Some(SCNetworkInterfaceType::WWAN) => {
+                found_metered = true;
+            }
+            _ => {}
+        }
+    }
+
+    if found_free {
+        TransportCost::Free
+    } else if found_metered {
+        TransportCost::Metered
+    } else {
+        TransportCost::Unknown
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn detect_network_cost() -> TransportCost {
+    TransportCost::Unknown
 }
 
 fn make_server_config() -> Result<ServerConfig> {
@@ -236,6 +355,17 @@ impl Transport for QuicTransport {
             bridge,
         });
 
+        let detected = detect_network_cost();
+        self.cost.store(
+            match detected {
+                TransportCost::Free => 0,
+                TransportCost::Metered => 1,
+                TransportCost::Unknown => 2,
+            },
+            Ordering::Relaxed,
+        );
+        tracing::debug!("QUIC transport cost detected: {:?}", detected);
+
         Ok(())
     }
 
@@ -324,7 +454,11 @@ impl Transport for QuicTransport {
     }
 
     fn cost(&self) -> TransportCost {
-        TransportCost::Metered
+        match self.cost.load(Ordering::Relaxed) {
+            0 => TransportCost::Free,
+            1 => TransportCost::Metered,
+            _ => TransportCost::Unknown,
+        }
     }
 
     fn kind(&self) -> TransportKind {
