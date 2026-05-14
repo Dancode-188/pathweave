@@ -128,6 +128,7 @@ impl PathweaveNode {
             Arc::clone(&self.peers),
             Arc::clone(&self.known_addrs),
             self.identity.peer_id().clone(),
+            self.router.event_tx(),
         ));
     }
 
@@ -192,7 +193,7 @@ impl PathweaveNode {
     }
 
     /// Returns a stream of transport lifecycle events from the Router.
-    pub fn events(&self) -> BoxStream<'_, TransportEvent> {
+    pub fn events(&self) -> BoxStream<'static, TransportEvent> {
         self.router.events()
     }
 }
