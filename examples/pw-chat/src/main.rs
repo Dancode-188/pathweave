@@ -2,8 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use futures::StreamExt;
 use pathweave_core::{
-    MessageHandler, NodeConfig, NodeIdentity, PeerAddress, PeerAnnouncement, PeerId,
+    MessageHandler, NodeConfig, NodeIdentity, PeerAddress, PeerAnnouncement, PeerId, TransportEvent,
 };
 use pathweave_transport_ble::BleTransport;
 use pathweave_transport_quic::QuicTransport;
@@ -16,13 +17,14 @@ const DEFAULT_LISTEN_PORT: u16 = 9001;
     name = "pw-chat",
     about = "Pathweave terminal chat demo",
     long_about = "Bidirectional encrypted chat over QUIC with automatic BLE fallback.\n\n\
-        Run with --peer on both sides for full bidirectional chat:\n\
+        Manual mode: specify --peer on both sides.\n\
         \n  Machine A:  pw-chat --peer 192.168.1.2:9001\
         \n  Machine B:  pw-chat --peer 192.168.1.1:9001\n\n\
-        Omit --peer to listen and receive only."
+        Auto-discovery mode: omit --peer. Both sides announce via mDNS and connect\n\
+        automatically when they see each other on the same network."
 )]
 struct Args {
-    /// QUIC peer address (host:port). Specify on both sides for bidirectional chat.
+    /// QUIC peer address (host:port). Omit to use mDNS auto-discovery.
     #[arg(long)]
     peer: Option<SocketAddr>,
 
@@ -58,21 +60,32 @@ async fn main() {
     let identity = NodeIdentity::generate();
     println!("my peer id: {}", identity.peer_id());
 
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse().unwrap();
+
     let mut node = pathweave_core::PathweaveNode::new(NodeConfig::default(), identity)
         .await
         .expect("failed to create node");
 
+    // Subscribe before registering transports: broadcast only delivers events sent
+    // after subscription. Registering first risks missing TransportChanged if a
+    // health_monitor task fires on another thread before events() is called.
+    let mut events = node.events();
+
+    let quic = QuicTransport::new(listen_addr);
+    node.register_transport(Box::new(quic));
+    node.register_transport(Box::new(BleTransport::new()));
+    loop {
+        match events.next().await {
+            Some(TransportEvent::TransportChanged { .. }) => break,
+            None => {
+                eprintln!("error: event stream closed before any transport started");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
     if let Some(peer_addr) = args.peer {
-        // Bidirectional mode: bind to a known port so the peer can connect back.
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse().unwrap();
-        let quic = QuicTransport::new(listen_addr);
-        node.register_transport(Box::new(quic));
-        node.register_transport(Box::new(BleTransport::new()));
-
-        // Give monitor tasks time to call start() and bind real sockets.
-        // yield_now() is sufficient for in-memory mocks but not for OS socket binding.
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
         let announcement = PeerAnnouncement {
             address: PeerAddress::Quic(peer_addr),
             short_id: None,
@@ -83,7 +96,10 @@ async fn main() {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("error: could not connect to {}: {}", peer_addr, e);
-                eprintln!("hint: check that the other side is running and port {} is not blocked by a firewall", args.port);
+                eprintln!(
+                    "hint: check that the other side is running and port {} is not blocked by a firewall",
+                    args.port
+                );
                 std::process::exit(1);
             }
         };
@@ -91,30 +107,38 @@ async fn main() {
         println!(" connected. peer: {}", short_id);
 
         node.on_message(Box::new(PrintHandler::new(short_id)));
-
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut lines = stdin.lines();
-        while let Some(line) = lines.next_line().await.expect("stdin error") {
-            if line.is_empty() {
-                continue;
-            }
-            if let Err(e) = node.send(peer_id.clone(), line.into_bytes()).await {
-                eprintln!("message failed: {}", e);
-            }
-        }
+        run_send_loop(&node, peer_id).await;
     } else {
-        // Listener mode: bind to the specified port and wait for connections.
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.port)
-            .parse()
-            .expect("invalid listen address");
-        let quic = QuicTransport::new(listen_addr);
-        node.register_transport(Box::new(quic));
-        node.register_transport(Box::new(BleTransport::new()));
+        println!("listening on {}. waiting for peer via mDNS...", listen_addr);
 
-        println!("listening on {}", listen_addr);
-        node.on_message(Box::new(PrintHandler::new("peer")));
+        let peer_id = loop {
+            match events.next().await {
+                Some(TransportEvent::PeerConnected(peer_id)) => break peer_id,
+                None => {
+                    eprintln!("error: event stream closed before a peer was discovered");
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+        };
 
-        // Block forever; the accept loop delivers messages to the handler.
-        std::future::pending::<()>().await;
+        let short_id = &peer_id.to_base58()[..8];
+        println!("peer discovered: {}. starting chat.", short_id);
+
+        node.on_message(Box::new(PrintHandler::new(short_id)));
+        run_send_loop(&node, peer_id).await;
+    }
+}
+
+async fn run_send_loop(node: &pathweave_core::PathweaveNode, peer_id: PeerId) {
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+    while let Some(line) = lines.next_line().await.expect("stdin error") {
+        if line.is_empty() {
+            continue;
+        }
+        if let Err(e) = node.send(peer_id.clone(), line.into_bytes()).await {
+            eprintln!("message failed: {}", e);
+        }
     }
 }

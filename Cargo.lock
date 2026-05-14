@@ -1669,6 +1669,7 @@ name = "pw-chat"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "pathweave-core",
  "pathweave-transport-ble",
  "pathweave-transport-quic",

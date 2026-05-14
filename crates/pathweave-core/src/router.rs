@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     BundleLayer, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, Result,
-    Session, Transport, TransportCost, TransportEvent,
+    Session, Transport, TransportCost, TransportEvent, TransportKind,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
@@ -57,9 +57,17 @@ impl Router {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
+        let kind = transport.kind();
         let t = Arc::clone(&transport);
         let a = Arc::clone(&available);
-        let task = tokio::spawn(health_monitor(t, started_tx, a, identity));
+        let task = tokio::spawn(health_monitor(
+            t,
+            started_tx,
+            a,
+            identity,
+            self.event_tx.clone(),
+            kind,
+        ));
 
         self.transports.push(TransportEntry {
             transport,
@@ -160,8 +168,13 @@ impl Router {
         Err(PathweaveError::NoTransportAvailable)
     }
 
+    /// Returns a clone of the event sender so callers can fire events into the same channel.
+    pub(crate) fn event_tx(&self) -> broadcast::Sender<TransportEvent> {
+        self.event_tx.clone()
+    }
+
     /// Returns a stream of transport lifecycle events.
-    pub fn events(&self) -> BoxStream<'_, TransportEvent> {
+    pub fn events(&self) -> BoxStream<'static, TransportEvent> {
         let rx = self.event_tx.subscribe();
         Box::pin(stream::unfold(rx, |mut rx| async move {
             loop {
@@ -206,11 +219,17 @@ pub(crate) async fn health_monitor(
     started: watch::Sender<bool>,
     available: Arc<AtomicBool>,
     identity: Arc<NodeIdentity>,
+    event_tx: broadcast::Sender<TransportEvent>,
+    kind: TransportKind,
 ) {
     let mut prev_addrs = current_ipv4_addrs();
     let mut in_recovery = if transport.start(&identity).await.is_ok() {
         available.store(true, Ordering::Release);
         let _ = started.send(true);
+        let _ = event_tx.send(TransportEvent::TransportChanged {
+            from: None,
+            to: kind,
+        });
         false
     } else {
         tracing::warn!(
@@ -235,6 +254,10 @@ pub(crate) async fn health_monitor(
         if transport.start(&identity).await.is_ok() {
             available.store(true, Ordering::Release);
             let _ = started.send(true);
+            let _ = event_tx.send(TransportEvent::TransportChanged {
+                from: None,
+                to: kind,
+            });
             prev_addrs = curr_addrs;
             in_recovery = false;
             tracing::info!(
@@ -335,6 +358,7 @@ pub(crate) async fn peer_stream(
     peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
     known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     local_peer_id: PeerId,
+    event_tx: broadcast::Sender<TransportEvent>,
 ) {
     loop {
         let _ = started.wait_for(|v| *v).await;
@@ -357,7 +381,8 @@ pub(crate) async fn peer_stream(
                 }
                 Ok(peer_id) => {
                     tracing::debug!(addr = %addr, peer = %peer_id, "mDNS: peer connected");
-                    peers.lock().unwrap().insert(peer_id, announcement);
+                    peers.lock().unwrap().insert(peer_id.clone(), announcement);
+                    let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
                 }
                 Err(e) => {
                     tracing::debug!(addr = %addr, "mDNS: handshake failed: {}", e);
@@ -831,11 +856,14 @@ mod tests {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
+        let (event_tx, _) = broadcast::channel(8);
         tokio::spawn(health_monitor(
             t,
             started_tx,
             Arc::clone(&available),
             Arc::new(NodeIdentity::generate()),
+            event_tx,
+            TransportKind::Ble,
         ));
 
         tokio::task::yield_now().await;
@@ -856,11 +884,14 @@ mod tests {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
+        let (event_tx, _) = broadcast::channel(8);
         tokio::spawn(health_monitor(
             transport,
             started_tx,
             Arc::clone(&available),
             Arc::new(NodeIdentity::generate()),
+            event_tx,
+            TransportKind::Ble,
         ));
 
         // Yield so the initial start() runs and fails.
@@ -898,11 +929,14 @@ mod tests {
         let available = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = watch::channel(false);
 
+        let (event_tx, _) = broadcast::channel(8);
         tokio::spawn(health_monitor(
             transport,
             started_tx,
             Arc::clone(&available),
             Arc::new(NodeIdentity::generate()),
+            event_tx,
+            TransportKind::Ble,
         ));
 
         tokio::task::yield_now().await;
@@ -991,6 +1025,7 @@ mod tests {
         let known_addrs = Arc::new(Mutex::new(HashSet::new()));
         let local_peer_id = NodeIdentity::generate().peer_id().clone();
 
+        let (event_tx, _) = broadcast::channel(8);
         tokio::spawn(peer_stream(
             transport,
             NodeIdentity::generate(),
@@ -998,6 +1033,7 @@ mod tests {
             Arc::clone(&peers),
             Arc::clone(&known_addrs),
             local_peer_id,
+            event_tx,
         ));
 
         // Start the transport: peer_stream calls discover() (first call, empty stream ends).
