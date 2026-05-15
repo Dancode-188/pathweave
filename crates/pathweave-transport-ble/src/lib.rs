@@ -669,9 +669,14 @@ impl Transport for BleTransport {
         // drops the existing BLEDevice cleanly before the new one is created.
         let _ = peripheral.disconnect().await;
 
-        peripheral
-            .connect()
+        // Give the Windows BLE stack time to fully tear down the previous
+        // session before issuing GetGattServicesWithCacheModeAsync on the
+        // new one. Without this settling window the WinRT call hangs.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), peripheral.connect())
             .await
+            .map_err(|_| PathweaveError::Transport("BLE connect timed out".into()))?
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
         peripheral
