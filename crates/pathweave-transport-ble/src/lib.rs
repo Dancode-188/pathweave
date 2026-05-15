@@ -956,8 +956,17 @@ impl BleTransport {
             ))
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
-        // Subscribe handler fires on subscribe and unsubscribe. Only signal
-        // peripheral_task when at least one client is currently subscribed.
+        // Subscribe handler fires on subscribe and unsubscribe.
+        //
+        // Size > 0: signal peripheral_task that a client is ready.
+        //
+        // Size == 0: the client disconnected. Drop write_tx by clearing
+        // write_forward so that BlePeripheralConnection.recv_bytes() returns
+        // an error, which unwinds handle_incoming, which drops reply_tx,
+        // which breaks the peripheral_task inner loop. Without this, the
+        // inner loop stays stuck and the next subscribe signal is silently
+        // consumed and ignored, making message delivery impossible.
+        let write_forward_for_unsub = Arc::clone(&write_forward);
         notify_char
             .SubscribedClientsChanged(&TypedEventHandler::new(
                 move |char: &Option<
@@ -969,6 +978,8 @@ impl BleTransport {
                     };
                     if c.SubscribedClients()?.Size()? > 0 {
                         let _ = subscribe_tx.send(());
+                    } else if let Ok(mut guard) = write_forward_for_unsub.lock() {
+                        *guard = None;
                     }
                     Ok(())
                 },
