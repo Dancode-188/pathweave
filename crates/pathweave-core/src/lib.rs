@@ -181,10 +181,19 @@ pub struct PeerAnnouncement {
     pub short_id: Option<[u8; 8]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PeerAddress {
     Quic(std::net::SocketAddr),
     Ble(String),
+}
+
+impl std::fmt::Display for PeerAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerAddress::Quic(addr) => write!(f, "{}", addr),
+            PeerAddress::Ble(id) => write!(f, "{}", id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

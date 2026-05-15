@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,7 +78,7 @@ pub struct PathweaveNode {
     // peers; it never removes. This invariant is what makes the concurrent
     // add_peer() edge case benign: even if known_addrs loses an entry, the
     // peers entry remains intact and send() continues to work.
-    known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
+    known_addrs: Arc<Mutex<HashSet<PeerAddress>>>,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
 }
@@ -141,9 +140,10 @@ impl PathweaveNode {
     /// Returns NoTransportAvailable if no registered transport is available or all fail.
     pub async fn connect(&mut self, announcement: PeerAnnouncement) -> Result<PeerId> {
         let peer_id = self.router.connect(&announcement, &self.identity).await?;
-        if let PeerAddress::Quic(addr) = &announcement.address {
-            self.known_addrs.lock().unwrap().insert(*addr);
-        }
+        self.known_addrs
+            .lock()
+            .unwrap()
+            .insert(announcement.address.clone());
         self.peers
             .lock()
             .unwrap()
@@ -156,9 +156,10 @@ impl PathweaveNode {
     /// Not part of the UniFFI boundary. Used by pw-chat to inject a QUIC peer
     /// address resolved from the command line, and by tests to set up known peers.
     pub fn add_peer(&mut self, peer_id: PeerId, announcement: PeerAnnouncement) {
-        if let PeerAddress::Quic(addr) = &announcement.address {
-            self.known_addrs.lock().unwrap().insert(*addr);
-        }
+        self.known_addrs
+            .lock()
+            .unwrap()
+            .insert(announcement.address.clone());
         self.peers.lock().unwrap().insert(peer_id, announcement);
     }
 
