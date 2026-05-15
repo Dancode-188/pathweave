@@ -1,14 +1,28 @@
+use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use clap::Parser;
+use crossterm::{
+    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use futures::StreamExt;
 use pathweave_core::{
     MessageHandler, NodeConfig, NodeIdentity, PeerAddress, PeerAnnouncement, PeerId, TransportEvent,
+    TransportKind,
 };
 use pathweave_transport_ble::BleTransport;
 use pathweave_transport_quic::QuicTransport;
-use tokio::io::AsyncBufReadExt;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Block, Borders, Paragraph},
+    Frame, Terminal,
+};
+use tokio::sync::mpsc;
 
 const DEFAULT_LISTEN_PORT: u16 = 9001;
 
@@ -33,32 +47,175 @@ struct Args {
     port: u16,
 }
 
-struct PrintHandler {
-    label: Arc<str>,
+struct TuiHandler {
+    tx: mpsc::UnboundedSender<(PeerId, Vec<u8>)>,
 }
 
-impl PrintHandler {
-    fn new(label: &str) -> Self {
+impl MessageHandler for TuiHandler {
+    fn on_message(&self, peer_id: PeerId, payload: Vec<u8>) {
+        let _ = self.tx.send((peer_id, payload));
+    }
+}
+
+struct App {
+    messages: Vec<String>,
+    input: String,
+    peer_id: Option<PeerId>,
+    peer_short_id: Option<String>,
+    transport_name: Option<&'static str>,
+    local_short_id: String,
+}
+
+impl App {
+    fn new(local_short_id: String, peer_id: Option<PeerId>, initial_transport: TransportKind) -> Self {
+        let peer_short_id = peer_id.as_ref().map(|id| id.to_base58()[..8].to_owned());
         Self {
-            label: Arc::from(label),
+            messages: Vec::new(),
+            input: String::new(),
+            peer_id,
+            peer_short_id,
+            transport_name: Some(transport_kind_name(initial_transport)),
+            local_short_id,
         }
     }
 }
 
-impl MessageHandler for PrintHandler {
-    fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
-        let text = String::from_utf8_lossy(&payload);
-        println!("{}: {}", self.label, text);
+fn transport_kind_name(kind: TransportKind) -> &'static str {
+    match kind {
+        TransportKind::Quic => "QUIC",
+        TransportKind::Ble => "BLE",
+    }
+}
+
+fn draw(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let peer_label = app.peer_short_id.as_deref().unwrap_or("waiting...");
+    let transport_label = app.transport_name.unwrap_or("none");
+    let status = Paragraph::new(format!(
+        " me: {}   peer: {}   transport: {}",
+        app.local_short_id, peer_label, transport_label
+    ))
+    .style(Style::default().bg(Color::Blue).fg(Color::White));
+    frame.render_widget(status, chunks[0]);
+
+    let inner_height = chunks[1].height.saturating_sub(2) as usize;
+    let start = app.messages.len().saturating_sub(inner_height);
+    let lines: Vec<Line> = app.messages[start..]
+        .iter()
+        .map(|m| Line::from(m.as_str()))
+        .collect();
+    let messages = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(messages, chunks[1]);
+
+    let input_text = format!("> {}", app.input);
+    let input_widget = Paragraph::new(input_text.as_str())
+        .block(Block::default().borders(Borders::ALL).title("input"));
+    frame.render_widget(input_widget, chunks[2]);
+
+    // Cursor: inside left border (x+1), past the "> " prompt (x+2), at end of input text.
+    let cursor_x = chunks[2].x + 1 + 2 + app.input.len() as u16;
+    let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
+    frame.set_cursor_position((cursor_x.min(max_x), chunks[2].y + 1));
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    node: &pathweave_core::PathweaveNode,
+    mut node_events: futures::stream::BoxStream<'static, TransportEvent>,
+    mut msg_rx: mpsc::UnboundedReceiver<(PeerId, Vec<u8>)>,
+    mut app: App,
+) -> io::Result<()> {
+    let mut key_events = EventStream::new();
+
+    loop {
+        terminal.draw(|f| draw(f, &app))?;
+
+        tokio::select! {
+            maybe_key = key_events.next() => {
+                let Some(Ok(Event::Key(key))) = maybe_key else { continue };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    KeyCode::Esc => {
+                        return Ok(());
+                    }
+                    KeyCode::Enter => {
+                        if !app.input.is_empty() {
+                            if let Some(peer_id) = app.peer_id.clone() {
+                                let text = std::mem::take(&mut app.input);
+                                app.messages.push(format!("me: {}", text));
+                                // Redraw before awaiting send so the message appears immediately.
+                                terminal.draw(|f| draw(f, &app))?;
+                                if let Err(e) = node.send(peer_id, text.into_bytes()).await {
+                                    app.messages.push(format!("[error] {}", e));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        app.input.push(c);
+                    }
+                    _ => {}
+                }
+            }
+            maybe_event = node_events.next() => {
+                match maybe_event {
+                    Some(TransportEvent::TransportChanged { to, .. }) => {
+                        app.transport_name = Some(transport_kind_name(to));
+                    }
+                    Some(TransportEvent::PeerConnected(peer_id)) => {
+                        let short_id = peer_id.to_base58()[..8].to_owned();
+                        app.messages.push(format!("[connected] peer: {}", short_id));
+                        app.peer_short_id = Some(short_id);
+                        app.peer_id = Some(peer_id);
+                    }
+                    Some(TransportEvent::PeerDisconnected(peer_id)) => {
+                        let short_id = peer_id.to_base58()[..8].to_owned();
+                        app.messages.push(format!("[disconnected] peer: {}", short_id));
+                    }
+                    None => {}
+                }
+            }
+            maybe_msg = msg_rx.recv() => {
+                if let Some((peer_id, payload)) = maybe_msg {
+                    let short_id = peer_id.to_base58()[..8].to_owned();
+                    let text = String::from_utf8_lossy(&payload);
+                    app.messages.push(format!("{}: {}", short_id, text));
+                }
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(|| io::stderr())
+        .init();
+
     let args = Args::parse();
 
     let identity = NodeIdentity::generate();
-    println!("my peer id: {}", identity.peer_id());
+    let local_short_id = identity.peer_id().to_base58()[..8].to_owned();
 
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse().unwrap();
 
@@ -66,34 +223,33 @@ async fn main() {
         .await
         .expect("failed to create node");
 
-    // Subscribe before registering transports: broadcast only delivers events sent
-    // after subscription. Registering first risks missing TransportChanged if a
-    // health_monitor task fires on another thread before events() is called.
+    // Subscribe before registering transports to avoid missing the first TransportChanged.
     let mut events = node.events();
 
-    let quic = QuicTransport::new(listen_addr);
-    node.register_transport(Box::new(quic));
+    node.register_transport(Box::new(QuicTransport::new(listen_addr)));
     node.register_transport(Box::new(BleTransport::new()));
-    loop {
+
+    let initial_transport = loop {
         match events.next().await {
-            Some(TransportEvent::TransportChanged { .. }) => break,
+            Some(TransportEvent::TransportChanged { to, .. }) => break to,
             None => {
                 eprintln!("error: event stream closed before any transport started");
                 std::process::exit(1);
             }
             _ => {}
         }
-    }
+    };
 
-    if let Some(peer_addr) = args.peer {
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+    node.on_message(Box::new(TuiHandler { tx: msg_tx }));
+
+    let initial_peer_id = if let Some(peer_addr) = args.peer {
         let announcement = PeerAnnouncement {
             address: PeerAddress::Quic(peer_addr),
             short_id: None,
         };
-
-        print!("connecting to {}...", peer_addr);
-        let peer_id = match node.connect(announcement).await {
-            Ok(id) => id,
+        match node.connect(announcement).await {
+            Ok(id) => Some(id),
             Err(e) => {
                 eprintln!("error: could not connect to {}: {}", peer_addr, e);
                 eprintln!(
@@ -102,43 +258,34 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
-        };
-        let short_id = &peer_id.to_base58()[..8];
-        println!(" connected. peer: {}", short_id);
-
-        node.on_message(Box::new(PrintHandler::new(short_id)));
-        run_send_loop(&node, peer_id).await;
+        }
     } else {
-        println!("listening on {}. waiting for peer via mDNS...", listen_addr);
+        None
+    };
 
-        let peer_id = loop {
-            match events.next().await {
-                Some(TransportEvent::PeerConnected(peer_id)) => break peer_id,
-                None => {
-                    eprintln!("error: event stream closed before a peer was discovered");
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        };
+    let app = App::new(local_short_id, initial_peer_id, initial_transport);
 
-        let short_id = &peer_id.to_base58()[..8];
-        println!("peer discovered: {}. starting chat.", short_id);
+    // Restore the terminal before printing any panic message, otherwise the
+    // shell is left in raw mode with the alternate screen active.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
 
-        node.on_message(Box::new(PrintHandler::new(short_id)));
-        run_send_loop(&node, peer_id).await;
-    }
-}
+    enable_raw_mode().expect("failed to enable raw mode");
+    execute!(io::stdout(), EnterAlternateScreen).expect("failed to enter alternate screen");
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(io::stdout())).expect("failed to create terminal");
 
-async fn run_send_loop(node: &pathweave_core::PathweaveNode, peer_id: PeerId) {
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    while let Some(line) = lines.next_line().await.expect("stdin error") {
-        if line.is_empty() {
-            continue;
-        }
-        if let Err(e) = node.send(peer_id.clone(), line.into_bytes()).await {
-            eprintln!("message failed: {}", e);
-        }
+    let result = run_app(&mut terminal, &node, events, msg_rx, app).await;
+
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+
+    if let Err(e) = result {
+        eprintln!("terminal error: {}", e);
+        std::process::exit(1);
     }
 }
