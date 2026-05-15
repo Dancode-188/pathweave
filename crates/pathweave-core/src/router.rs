@@ -294,7 +294,7 @@ pub(crate) async fn health_monitor(
                 "transport restarted after address change"
             );
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 transport = transport.name(),
                 "transport restart failed; will retry"
             );
