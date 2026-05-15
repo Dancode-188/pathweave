@@ -9,8 +9,8 @@ use crossterm::{
 };
 use futures::StreamExt;
 use pathweave_core::{
-    MessageHandler, NodeConfig, NodeIdentity, PeerAddress, PeerAnnouncement, PeerId, TransportEvent,
-    TransportKind,
+    MessageHandler, NodeConfig, NodeIdentity, PeerAddress, PeerAnnouncement, PeerId,
+    TransportEvent, TransportKind,
 };
 use pathweave_transport_ble::BleTransport;
 use pathweave_transport_quic::QuicTransport;
@@ -67,7 +67,11 @@ struct App {
 }
 
 impl App {
-    fn new(local_short_id: String, peer_id: Option<PeerId>, initial_transport: TransportKind) -> Self {
+    fn new(
+        local_short_id: String,
+        peer_id: Option<PeerId>,
+        initial_transport: TransportKind,
+    ) -> Self {
         let peer_short_id = peer_id.as_ref().map(|id| id.to_base58()[..8].to_owned());
         Self {
             messages: Vec::new(),
