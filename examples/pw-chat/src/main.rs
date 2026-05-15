@@ -151,16 +151,14 @@ async fn run_app(
                     KeyCode::Esc => {
                         return Ok(());
                     }
-                    KeyCode::Enter => {
-                        if !app.input.is_empty() {
-                            if let Some(peer_id) = app.peer_id.clone() {
-                                let text = std::mem::take(&mut app.input);
-                                app.messages.push(format!("me: {}", text));
-                                // Redraw before awaiting send so the message appears immediately.
-                                terminal.draw(|f| draw(f, &app))?;
-                                if let Err(e) = node.send(peer_id, text.into_bytes()).await {
-                                    app.messages.push(format!("[error] {}", e));
-                                }
+                    KeyCode::Enter if !app.input.is_empty() => {
+                        if let Some(peer_id) = app.peer_id.clone() {
+                            let text = std::mem::take(&mut app.input);
+                            app.messages.push(format!("me: {}", text));
+                            // Redraw before awaiting send so the message appears immediately.
+                            terminal.draw(|f| draw(f, &app))?;
+                            if let Err(e) = node.send(peer_id, text.into_bytes()).await {
+                                app.messages.push(format!("[error] {}", e));
                             }
                         }
                     }
@@ -209,7 +207,7 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_writer(|| io::stderr())
+        .with_writer(io::stderr)
         .init();
 
     let args = Args::parse();
