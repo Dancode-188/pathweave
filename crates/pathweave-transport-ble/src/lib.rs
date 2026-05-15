@@ -662,6 +662,13 @@ impl Transport for BleTransport {
                 ))
             })?;
 
+        // Dropping a BleConnection without calling close() leaves the btleplug
+        // Peripheral's internal BLEDevice alive. When connect() creates a new
+        // BLEDevice for the same address while the old one is still open,
+        // Windows returns RO_E_CLOSED on the new handle. Disconnecting first
+        // drops the existing BLEDevice cleanly before the new one is created.
+        let _ = peripheral.disconnect().await;
+
         peripheral
             .connect()
             .await

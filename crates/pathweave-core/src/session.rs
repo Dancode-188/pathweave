@@ -134,6 +134,10 @@ impl Session {
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
     }
+
+    pub async fn close(&mut self) -> Result<()> {
+        self.conn.close().await
+    }
 }
 
 #[cfg(test)]

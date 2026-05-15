@@ -328,7 +328,8 @@ fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
 }
 
 /// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
-/// The session is dropped after the handshake, closing the connection.
+/// The session is closed explicitly so transports that require an active teardown
+/// (e.g. BLE peripheral.disconnect()) release their resources before the next connect.
 async fn try_connect(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
@@ -336,8 +337,10 @@ async fn try_connect(
 ) -> Result<PeerId> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
-    let session = Session::initiate(identity, bundled).await?;
-    Ok(session.peer_id().clone())
+    let mut session = Session::initiate(identity, bundled).await?;
+    let peer_id = session.peer_id().clone();
+    let _ = session.close().await;
+    Ok(peer_id)
 }
 
 /// Generates a cryptographically random 64-bit message ID from OS entropy.
