@@ -84,7 +84,7 @@ let mut events = node.events(); // Stream<Item = TransportEvent>
 // register a transport before first use
 node.register_transport(Box::new(quic));
 
-// dial a peer, complete the Noise_XX handshake, store the PeerId -> address mapping
+// dial a peer, complete the Noise_XX handshake, push the address into the peer's list
 // the session closes immediately after the handshake; send() re-dials on each call
 node.connect(announcement).await?;
 
@@ -93,8 +93,10 @@ node.add_peer(peer_id, announcement);
 ```
 
 `connect()` tries transports in cost order (Free first). It returns the PeerId learned
-from the Noise_XX handshake. Subsequent `send()` calls look up the stored address and
-re-dial lazily.
+from the Noise_XX handshake. The address is pushed into `peers[peer_id]`, a
+`Vec<PeerAnnouncement>`. A peer can accumulate addresses from multiple transports (one
+QUIC address, one BLE address, or both). Subsequent `send()` calls retrieve the full
+list and route across all known addresses. See ADR 016.
 
 **MessageHandler** is a callback interface, not a closure. This is a UniFFI requirement --
 closures don't cross FFI boundaries cleanly. In Rust, you implement the trait. In Swift,
@@ -246,10 +248,23 @@ level, signal quality, and payload-size routing are deferred beyond v0.2.0.
 
 Static priority fallback. That's what it is and what we call it.
 
-1. If BLE is available and the peer is reachable over BLE, use BLE.
-2. Otherwise, use QUIC.
+**Peer table:** `HashMap<PeerId, Vec<PeerAnnouncement>>`. A peer discovered via both
+mDNS (QUIC address) and BLE scan (BLE address) accumulates both addresses in its Vec.
+`peer_stream` deduplicates upstream: the `known_addrs` HashSet prevents a given address
+from reaching the handshake or the Vec a second time. `connect()` and `add_peer()` check
+the Vec directly with an address-equality guard before pushing. The Vec is never pruned
+at runtime; stale address removal is deferred to v0.3.0. See ADR 016.
 
-The routing gets real cost intelligence later in v0.2.0. For now, free transport wins.
+**Candidate building:** `send()` and `connect()` build a candidate list of
+`(transport, announcement)` pairs where the transport kind matches the announcement
+address kind (`PeerAddress::Quic` with `TransportKind::Quic`, `PeerAddress::Ble` with
+`TransportKind::Ble`). Mismatched pairs are excluded at build time rather than failing
+at dial time. Candidates are sorted by transport cost (Free first). All pairs in the
+list are tried before an attempt is counted as failed.
+
+This means: if a peer is known by a BLE address and a QUIC address, and BLE fails, the
+router tries QUIC within the same attempt. No retry sleep is paid for a same-attempt
+cross-transport fallback.
 
 **How the switch works: health monitoring, lazy connections**
 
@@ -271,11 +286,11 @@ connection on the best available transport when `send()` is called.
 
 **Retry behavior**
 
-`send()` retries up to `MAX_SEND_ATTEMPTS` (3) times across available transports, with
-a 1-second back-off (`RETRY_BACKOFF`) between attempts. Each attempt dials the peer,
-completes the Noise_XX handshake, sends the framed payload, and waits for the delivery
-ACK. If all attempts fail, `send()` returns `PathweaveError::DeliveryFailed`. See the
-delivery guarantees section.
+`send()` retries up to `MAX_SEND_ATTEMPTS` (3) times. Each attempt builds the full
+candidate list (all matching transport-address pairs in cost order), tries every pair
+in the list, then backs off for 1 second (`RETRY_BACKOFF`) before the next attempt. If
+all attempts across all candidates fail, `send()` returns `PathweaveError::DeliveryFailed`.
+See the delivery guarantees section.
 
 ---
 

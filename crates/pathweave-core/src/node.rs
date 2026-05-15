@@ -66,13 +66,14 @@ impl DeduplicationCache {
 /// Callers create a node, register transports, inject any known peer addresses, and
 /// then use the four documented API surfaces (send, on_message, events, new).
 ///
-/// The peer table maps PeerId -> PeerAnnouncement. The discover task (one per
-/// transport) populates it automatically via mDNS. add_peer() and connect() also
-/// insert into the table for manually-supplied addresses.
+/// The peer table maps PeerId -> Vec<PeerAnnouncement>. A peer reachable via multiple
+/// transports accumulates one address per transport. The peer_stream task (one per
+/// transport) populates it automatically via discovery. add_peer() and connect() also
+/// push addresses for manually-supplied peers. See ADR 016.
 pub struct PathweaveNode {
     router: Router,
     identity: NodeIdentity,
-    peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
+    peers: Arc<Mutex<HashMap<PeerId, Vec<PeerAnnouncement>>>>,
     // Dedup-only: tracks addresses currently in-flight or already connected.
     // Not authoritative for routing — peers is. peer_stream only upserts to
     // peers; it never removes. This invariant is what makes the concurrent
@@ -139,15 +140,19 @@ impl PathweaveNode {
     ///
     /// Returns NoTransportAvailable if no registered transport is available or all fail.
     pub async fn connect(&mut self, announcement: PeerAnnouncement) -> Result<PeerId> {
-        let peer_id = self.router.connect(&announcement, &self.identity).await?;
+        let peer_id = self
+            .router
+            .connect(std::slice::from_ref(&announcement), &self.identity)
+            .await?;
         self.known_addrs
             .lock()
             .unwrap()
             .insert(announcement.address.clone());
-        self.peers
-            .lock()
-            .unwrap()
-            .insert(peer_id.clone(), announcement);
+        let mut peers = self.peers.lock().unwrap();
+        let addrs = peers.entry(peer_id.clone()).or_default();
+        if !addrs.iter().any(|a| a.address == announcement.address) {
+            addrs.push(announcement);
+        }
         Ok(peer_id)
     }
 
@@ -160,7 +165,11 @@ impl PathweaveNode {
             .lock()
             .unwrap()
             .insert(announcement.address.clone());
-        self.peers.lock().unwrap().insert(peer_id, announcement);
+        let mut peers = self.peers.lock().unwrap();
+        let addrs = peers.entry(peer_id).or_default();
+        if !addrs.iter().any(|a| a.address == announcement.address) {
+            addrs.push(announcement);
+        }
     }
 
     /// Sends `payload` to the peer identified by `peer_id`.
@@ -172,7 +181,7 @@ impl PathweaveNode {
     /// Returns NoTransportAvailable if the peer is not in the peer table or if
     /// no registered transport can reach the peer.
     pub async fn send(&self, peer_id: PeerId, payload: Vec<u8>) -> Result<()> {
-        let announcement = self
+        let announcements = self
             .peers
             .lock()
             .unwrap()
@@ -180,7 +189,7 @@ impl PathweaveNode {
             .cloned()
             .ok_or(PathweaveError::NoTransportAvailable)?;
         self.router
-            .send(&announcement, &self.identity, payload)
+            .send(&announcements, &self.identity, payload)
             .await
     }
 

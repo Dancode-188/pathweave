@@ -187,6 +187,15 @@ pub enum PeerAddress {
     Ble(String),
 }
 
+impl PeerAddress {
+    pub fn kind(&self) -> TransportKind {
+        match self {
+            PeerAddress::Quic(_) => TransportKind::Quic,
+            PeerAddress::Ble(_) => TransportKind::Ble,
+        }
+    }
+}
+
 impl std::fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

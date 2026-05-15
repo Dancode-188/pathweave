@@ -84,12 +84,16 @@ impl Router {
     /// retry attempts. The receiver's deduplication cache suppresses duplicate delivery
     /// when the same ID arrives more than once (ADR 011).
     ///
-    /// Returns NoTransportAvailable immediately if no transport is currently available.
-    /// Returns DeliveryFailed if all attempts across all available transports are
-    /// exhausted without receiving a delivery ACK.
+    /// Each attempt builds a candidate list of (transport, announcement) pairs where
+    /// the transport kind matches the announcement address kind, sorted by transport
+    /// cost (Free first). All pairs are tried before the attempt is counted as failed.
+    ///
+    /// Returns NoTransportAvailable if no transport is currently available or no
+    /// registered transport can handle any of the given addresses.
+    /// Returns DeliveryFailed if all attempts are exhausted without a delivery ACK.
     pub async fn send(
         &self,
-        peer: &PeerAnnouncement,
+        peers: &[PeerAnnouncement],
         identity: &NodeIdentity,
         payload: Vec<u8>,
     ) -> Result<()> {
@@ -104,22 +108,35 @@ impl Router {
         let message_id = new_message_id();
 
         for attempt in 0..MAX_SEND_ATTEMPTS {
-            let mut candidates: Vec<&TransportEntry> = self
+            let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
                 .transports
                 .iter()
                 .filter(|t| t.available.load(Ordering::Acquire))
+                .flat_map(|entry| {
+                    peers.iter().filter_map(move |ann| {
+                        if ann.address.kind() == entry.transport.kind() {
+                            Some((entry, ann))
+                        } else {
+                            None
+                        }
+                    })
+                })
                 .collect();
 
-            candidates.sort_by_key(|t| match t.transport.cost() {
+            if candidates.is_empty() {
+                return Err(PathweaveError::NoTransportAvailable);
+            }
+
+            candidates.sort_by_key(|(entry, _)| match entry.transport.cost() {
                 TransportCost::Free => 0u8,
                 TransportCost::Metered => 1,
                 TransportCost::Unknown => 2,
             });
 
-            for entry in candidates {
+            for (entry, ann) in &candidates {
                 if try_send(
                     entry.transport.as_ref(),
-                    peer,
+                    ann,
                     identity,
                     &payload,
                     message_id,
@@ -139,28 +156,40 @@ impl Router {
         Err(PathweaveError::DeliveryFailed)
     }
 
-    /// Dials `peer`, completes the Noise_XX handshake as the initiator, and returns
-    /// the remote PeerId. Tries transports in cost order (Free first). The session is
-    /// closed after the handshake; the caller is responsible for storing the mapping.
+    /// Dials each address in `peers` in transport-cost order, completes the
+    /// Noise_XX handshake as the initiator, and returns the remote PeerId on
+    /// the first success. Tries (transport, announcement) pairs where the
+    /// transport kind matches the announcement address kind. The session is
+    /// closed after the handshake; the caller is responsible for storing the
+    /// PeerId -> announcements mapping.
     pub async fn connect(
         &self,
-        peer: &PeerAnnouncement,
+        peers: &[PeerAnnouncement],
         identity: &NodeIdentity,
     ) -> Result<PeerId> {
-        let mut candidates: Vec<&TransportEntry> = self
+        let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
             .transports
             .iter()
             .filter(|t| t.available.load(Ordering::Acquire))
+            .flat_map(|entry| {
+                peers.iter().filter_map(move |ann| {
+                    if ann.address.kind() == entry.transport.kind() {
+                        Some((entry, ann))
+                    } else {
+                        None
+                    }
+                })
+            })
             .collect();
 
-        candidates.sort_by_key(|t| match t.transport.cost() {
+        candidates.sort_by_key(|(entry, _)| match entry.transport.cost() {
             TransportCost::Free => 0u8,
             TransportCost::Metered => 1,
             TransportCost::Unknown => 2,
         });
 
-        for entry in candidates {
-            if let Ok(peer_id) = try_connect(entry.transport.as_ref(), peer, identity).await {
+        for (entry, ann) in candidates {
+            if let Ok(peer_id) = try_connect(entry.transport.as_ref(), ann, identity).await {
                 return Ok(peer_id);
             }
         }
@@ -355,7 +384,7 @@ pub(crate) async fn peer_stream(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
     mut started: watch::Receiver<bool>,
-    peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
+    peers: Arc<Mutex<HashMap<PeerId, Vec<PeerAnnouncement>>>>,
     known_addrs: Arc<Mutex<HashSet<PeerAddress>>>,
     local_peer_id: PeerId,
     event_tx: broadcast::Sender<TransportEvent>,
@@ -378,7 +407,12 @@ pub(crate) async fn peer_stream(
                 }
                 Ok(peer_id) => {
                     tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
-                    peers.lock().unwrap().insert(peer_id.clone(), announcement);
+                    peers
+                        .lock()
+                        .unwrap()
+                        .entry(peer_id.clone())
+                        .or_default()
+                        .push(announcement);
                     let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
                 }
                 Err(e) => {
@@ -572,6 +606,20 @@ mod tests {
         }
     }
 
+    // Peer reachable via both BLE and QUIC: used to test cross-transport fallback.
+    fn dual_peer() -> Vec<PeerAnnouncement> {
+        vec![
+            PeerAnnouncement {
+                address: PeerAddress::Ble("aa:bb:cc:dd:ee:ff".into()),
+                short_id: None,
+            },
+            PeerAnnouncement {
+                address: PeerAddress::Quic("127.0.0.1:9001".parse().unwrap()),
+                short_id: None,
+            },
+        ]
+    }
+
     /// Runs a responder: completes the Noise_XX handshake, receives one message, and
     /// sends an empty ACK so try_send() can return before dropping the connection.
     async fn run_responder(conn: TestConn, identity: NodeIdentity) {
@@ -579,6 +627,43 @@ mod tests {
         let mut session = Session::respond(&identity, bundled).await.unwrap();
         let _ = session.recv().await;
         let _ = session.send(b"").await;
+    }
+
+    #[tokio::test]
+    async fn send_with_dual_address_peer_prefers_free_transport_and_skips_metered() {
+        // When the peer has both addresses and BLE succeeds, QUIC must not be attempted.
+        let (ble, mut ble_rx, ble_count) =
+            make_transport(TransportCost::Free, TransportKind::Ble, false);
+        let (quic, _quic_rx, quic_count) =
+            make_transport(TransportCost::Metered, TransportKind::Quic, false);
+
+        let identity = Arc::new(NodeIdentity::generate());
+        let mut router = Router::new();
+        router.register_transport(ble, Arc::clone(&identity));
+        router.register_transport(quic, Arc::clone(&identity));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let sender_id = NodeIdentity::generate();
+        let responder_id = NodeIdentity::generate();
+
+        tokio::spawn(async move {
+            let conn = ble_rx.recv().await.unwrap();
+            run_responder(conn, responder_id).await;
+        });
+
+        router
+            .send(&dual_peer(), &sender_id, b"hello".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(ble_count.load(Ordering::Relaxed), 1, "BLE should be used");
+        assert_eq!(
+            quic_count.load(Ordering::Relaxed),
+            0,
+            "QUIC must not be attempted when BLE succeeds"
+        );
     }
 
     #[tokio::test]
@@ -606,7 +691,7 @@ mod tests {
         });
 
         router
-            .send(&dummy_peer(), &sender_id, b"hello".to_vec())
+            .send(&[dummy_peer()], &sender_id, b"hello".to_vec())
             .await
             .unwrap();
 
@@ -620,6 +705,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_falls_back_on_connect_failure() {
+        // Peer has both a BLE address and a QUIC address. BLE transport fails;
+        // router should fall back to the QUIC address on the same attempt.
         let (ble, _ble_rx, ble_count) =
             make_transport(TransportCost::Free, TransportKind::Ble, true); // fail
         let (quic, mut quic_rx, quic_count) =
@@ -642,7 +729,7 @@ mod tests {
         });
 
         router
-            .send(&dummy_peer(), &sender_id, b"fallback".to_vec())
+            .send(&dual_peer(), &sender_id, b"fallback".to_vec())
             .await
             .unwrap();
 
@@ -660,6 +747,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn send_returns_delivery_failed_when_all_transports_fail() {
+        // Peer has both addresses; both transports fail. Each attempt tries
+        // BLE first (Free) then QUIC (Metered) before backing off.
         let (ble, _ble_rx, ble_count) =
             make_transport(TransportCost::Free, TransportKind::Ble, true);
         let (quic, _quic_rx, quic_count) =
@@ -675,7 +764,7 @@ mod tests {
 
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
+            .send(&dual_peer(), &sender_id, b"ignored".to_vec())
             .await;
 
         assert!(
@@ -699,7 +788,7 @@ mod tests {
         let router = Router::new();
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
+            .send(&[dummy_peer()], &sender_id, b"ignored".to_vec())
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
@@ -726,7 +815,7 @@ mod tests {
         });
 
         router
-            .send(&dummy_peer(), &sender_id, b"hello".to_vec())
+            .send(&[dummy_peer()], &sender_id, b"hello".to_vec())
             .await
             .unwrap();
 
@@ -748,7 +837,7 @@ mod tests {
         // No yield: monitoring task has not run, available = false.
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&dummy_peer(), &sender_id, b"ignored".to_vec())
+            .send(&[dummy_peer()], &sender_id, b"ignored".to_vec())
             .await;
 
         assert!(
@@ -782,7 +871,10 @@ mod tests {
             run_responder(conn, responder_id).await;
         });
 
-        let peer_id = router.connect(&dummy_peer(), &initiator_id).await.unwrap();
+        let peer_id = router
+            .connect(&[dummy_peer()], &initiator_id)
+            .await
+            .unwrap();
         assert_eq!(peer_id, expected_peer_id);
     }
 
@@ -790,7 +882,7 @@ mod tests {
     async fn connect_returns_no_transport_when_none_registered() {
         let router = Router::new();
         let identity = NodeIdentity::generate();
-        let result = router.connect(&dummy_peer(), &identity).await;
+        let result = router.connect(&[dummy_peer()], &identity).await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
 
