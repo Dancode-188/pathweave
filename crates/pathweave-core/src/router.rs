@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -338,7 +338,7 @@ async fn try_send(
     }
 }
 
-/// Drives mDNS peer discovery for a single transport across restarts.
+/// Drives peer discovery for a single transport across restarts.
 ///
 /// Waits for the transport to start, then drains its discover() stream. For
 /// each announced address that is not already in `known_addrs`, performs a
@@ -356,7 +356,7 @@ pub(crate) async fn peer_stream(
     identity: NodeIdentity,
     mut started: watch::Receiver<bool>,
     peers: Arc<Mutex<HashMap<PeerId, PeerAnnouncement>>>,
-    known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
+    known_addrs: Arc<Mutex<HashSet<PeerAddress>>>,
     local_peer_id: PeerId,
     event_tx: broadcast::Sender<TransportEvent>,
 ) {
@@ -364,28 +364,25 @@ pub(crate) async fn peer_stream(
         let _ = started.wait_for(|v| *v).await;
         let mut discover = transport.discover();
         while let Some(announcement) = discover.next().await {
-            let addr = match &announcement.address {
-                PeerAddress::Quic(addr) => *addr,
-                _ => continue,
-            };
+            let addr = announcement.address.clone();
 
             // Skip re-announcements from already-connected addresses (O(1) check).
-            if !known_addrs.lock().unwrap().insert(addr) {
+            if !known_addrs.lock().unwrap().insert(addr.clone()) {
                 continue;
             }
 
             match try_connect(transport.as_ref(), &announcement, &identity).await {
                 Ok(peer_id) if peer_id == local_peer_id => {
                     // Self-discovery: keep addr in known_addrs so we don't retry.
-                    tracing::debug!(addr = %addr, "mDNS: discovered self; skipping");
+                    tracing::debug!(addr = %addr, "discovered self; skipping");
                 }
                 Ok(peer_id) => {
-                    tracing::debug!(addr = %addr, peer = %peer_id, "mDNS: peer connected");
+                    tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
                     peers.lock().unwrap().insert(peer_id.clone(), announcement);
                     let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
                 }
                 Err(e) => {
-                    tracing::debug!(addr = %addr, "mDNS: handshake failed: {}", e);
+                    tracing::debug!(addr = %addr, "handshake failed: {}", e);
                     // Remove so we retry on the next re-announcement.
                     known_addrs.lock().unwrap().remove(&addr);
                 }
