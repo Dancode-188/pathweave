@@ -134,7 +134,13 @@ impl Router {
             });
 
             for (entry, ann) in &candidates {
-                if try_send(
+                tracing::debug!(
+                    attempt,
+                    transport = entry.transport.name(),
+                    addr = ?ann.address,
+                    "try_send attempt"
+                );
+                match try_send(
                     entry.transport.as_ref(),
                     ann,
                     identity,
@@ -142,9 +148,15 @@ impl Router {
                     message_id,
                 )
                 .await
-                .is_ok()
                 {
-                    return Ok(());
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::debug!(
+                        attempt,
+                        transport = entry.transport.name(),
+                        addr = ?ann.address,
+                        error = %e,
+                        "try_send failed"
+                    ),
                 }
             }
 
@@ -348,21 +360,33 @@ async fn try_send(
     payload: &[u8],
     message_id: u64,
 ) -> Result<()> {
-    let raw = transport.connect(peer).await?;
+    let raw = transport.connect(peer).await.map_err(|e| {
+        tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
+        e
+    })?;
     let bundled = Box::new(BundleLayer::new(raw));
-    let mut session = Session::initiate(identity, bundled).await?;
+    let mut session = Session::initiate(identity, bundled).await.map_err(|e| {
+        tracing::debug!(addr = ?peer.address, error = %e, "try_send: handshake failed");
+        e
+    })?;
 
     let mut framed = Vec::with_capacity(8 + payload.len());
     framed.extend_from_slice(&message_id.to_be_bytes());
     framed.extend_from_slice(payload);
 
-    session.send(&framed).await?;
+    session.send(&framed).await.map_err(|e| {
+        tracing::debug!(addr = ?peer.address, error = %e, "try_send: send failed");
+        e
+    })?;
     // Quinn's write_all() buffers internally; CONNECTION_CLOSE fires when the last
     // connection handle drops, which happens before the buffer is flushed. Waiting
     // for the receiver's ACK keeps the connection alive until the data is delivered.
     match tokio::time::timeout(Duration::from_secs(5), session.recv()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e),
+        Ok(Err(e)) => {
+            tracing::debug!(addr = ?peer.address, error = %e, "try_send: ACK recv failed");
+            Err(e)
+        }
         Err(_) => Err(PathweaveError::Transport("delivery ACK timed out".into())),
     }
 }
