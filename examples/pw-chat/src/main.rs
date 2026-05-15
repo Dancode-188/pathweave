@@ -206,10 +206,12 @@ async fn run_app(
 
 #[tokio::main]
 async fn main() {
+    // Default to off: any write to stderr bleeds into the alternate screen on
+    // most terminals. Set RUST_LOG to enable tracing when debugging.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
         )
         .with_writer(io::stderr)
         .init();
