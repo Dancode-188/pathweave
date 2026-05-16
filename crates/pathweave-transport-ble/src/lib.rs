@@ -587,6 +587,44 @@ impl Transport for BleTransport {
             while let Some(event) = events.next().await {
                 tracing::debug!("BLE central event: {:?}", event);
                 match event {
+                    // On Linux/BlueZ, the first time a device is seen during a scan
+                    // BlueZ fires InterfacesAdded, which btleplug maps to DeviceDiscovered.
+                    // ServiceDataAdvertisement only arrives on subsequent property-change
+                    // events (PropertyChanged). If we ignore DeviceDiscovered we miss the
+                    // peer entirely until it re-advertises and triggers a property change.
+                    // We query the device properties here so we catch the peer on first sight.
+                    CentralEvent::DeviceDiscovered(id) => {
+                        let peripheral = match adapter.peripheral(&id).await {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let props = match peripheral.properties().await {
+                            Ok(Some(p)) => p,
+                            _ => continue,
+                        };
+                        if let Some(data) = props.service_data.get(&PATHWEAVE_SERVICE_UUID) {
+                            let data = data.clone();
+                            if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
+                                continue;
+                            }
+                            let short_id: [u8; 8] = data[1..9].try_into().unwrap();
+                            let announcement = PeerAnnouncement {
+                                address: PeerAddress::Ble(id.to_string()),
+                                short_id: Some(short_id),
+                            };
+                            if tx.unbounded_send(announcement).is_err() {
+                                break;
+                            }
+                        } else if props.services.contains(&PATHWEAVE_SERVICE_UUID) {
+                            let announcement = PeerAnnouncement {
+                                address: PeerAddress::Ble(id.to_string()),
+                                short_id: None,
+                            };
+                            if tx.unbounded_send(announcement).is_err() {
+                                break;
+                            }
+                        }
+                    }
                     CentralEvent::ServiceDataAdvertisement { id, service_data } => {
                         let data = match service_data.get(&PATHWEAVE_SERVICE_UUID) {
                             Some(d) => d.clone(),
