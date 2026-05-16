@@ -841,7 +841,7 @@ impl BleTransport {
         // advertisement and discover() never fires.
         let adv = bluer::adv::Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
-            service_uuids: vec![PATHWEAVE_SERVICE_UUID],
+            service_uuids: [PATHWEAVE_SERVICE_UUID].into_iter().collect(),
             service_data: svc_data,
             ..Default::default()
         };
