@@ -834,8 +834,14 @@ impl BleTransport {
         payload.extend_from_slice(&short_id);
         svc_data.insert(PATHWEAVE_SERVICE_UUID, payload);
 
+        // services populates the "Complete List of 128-bit Service Class UUIDs" AD type
+        // (0x07). BlueZ's SetDiscoveryFilter UUID check reads that list. service_data
+        // alone produces only AD type 0x21, which BlueZ does not reliably extract into
+        // the device's UUID list on all versions, so the scan filter silently drops the
+        // advertisement and discover() never fires.
         let adv = bluer::adv::Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
+            services: vec![PATHWEAVE_SERVICE_UUID],
             service_data: svc_data,
             ..Default::default()
         };
