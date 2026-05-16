@@ -206,15 +206,24 @@ async fn run_app(
 
 #[tokio::main]
 async fn main() {
-    // Default to off: any write to stderr bleeds into the alternate screen on
-    // most terminals. Set RUST_LOG to enable tracing when debugging.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
-        )
-        .with_writer(io::stderr)
-        .init();
+    // Default to off so nothing bleeds into the TUI's alternate screen.
+    // When RUST_LOG is set, write to /tmp/pathweave.log instead of stderr
+    // so the logs land somewhere readable regardless of terminal state.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+    if std::env::var_os("RUST_LOG").is_some() {
+        let log_file = std::fs::File::create("/tmp/pathweave.log")
+            .expect("failed to create /tmp/pathweave.log");
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(log_file))
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(io::stderr)
+            .init();
+    }
 
     let args = Args::parse();
 
