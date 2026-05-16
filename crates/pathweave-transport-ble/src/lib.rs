@@ -573,6 +573,7 @@ impl Transport for BleTransport {
                 tracing::warn!("BLE scan failed to start: {}", e);
                 return;
             }
+            tracing::debug!("BLE scan started");
 
             let events = match adapter.events().await {
                 Ok(e) => e,
@@ -584,6 +585,7 @@ impl Transport for BleTransport {
             futures::pin_mut!(events);
 
             while let Some(event) = events.next().await {
+                tracing::debug!("BLE central event: {:?}", event);
                 match event {
                     CentralEvent::ServiceDataAdvertisement { id, service_data } => {
                         let data = match service_data.get(&PATHWEAVE_SERVICE_UUID) {
@@ -850,6 +852,7 @@ impl BleTransport {
             .advertise(adv)
             .await
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        tracing::debug!("BLE peripheral advertising started");
 
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(peripheral_loop(write_ctrl, notify_ctrl, conn_tx));
