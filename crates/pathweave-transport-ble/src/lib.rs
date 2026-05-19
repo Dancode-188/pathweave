@@ -573,6 +573,7 @@ impl Transport for BleTransport {
                 tracing::warn!("BLE scan failed to start: {}", e);
                 return;
             }
+            tracing::debug!("BLE scan started");
 
             let events = match adapter.events().await {
                 Ok(e) => e,
@@ -584,7 +585,46 @@ impl Transport for BleTransport {
             futures::pin_mut!(events);
 
             while let Some(event) = events.next().await {
+                tracing::debug!("BLE central event: {:?}", event);
                 match event {
+                    // On Linux/BlueZ, the first time a device is seen during a scan
+                    // BlueZ fires InterfacesAdded, which btleplug maps to DeviceDiscovered.
+                    // ServiceDataAdvertisement only arrives on subsequent property-change
+                    // events (PropertyChanged). If we ignore DeviceDiscovered we miss the
+                    // peer entirely until it re-advertises and triggers a property change.
+                    // We query the device properties here so we catch the peer on first sight.
+                    CentralEvent::DeviceDiscovered(id) => {
+                        let peripheral = match adapter.peripheral(&id).await {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let props = match peripheral.properties().await {
+                            Ok(Some(p)) => p,
+                            _ => continue,
+                        };
+                        if let Some(data) = props.service_data.get(&PATHWEAVE_SERVICE_UUID) {
+                            let data = data.clone();
+                            if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
+                                continue;
+                            }
+                            let short_id: [u8; 8] = data[1..9].try_into().unwrap();
+                            let announcement = PeerAnnouncement {
+                                address: PeerAddress::Ble(id.to_string()),
+                                short_id: Some(short_id),
+                            };
+                            if tx.unbounded_send(announcement).is_err() {
+                                break;
+                            }
+                        } else if props.services.contains(&PATHWEAVE_SERVICE_UUID) {
+                            let announcement = PeerAnnouncement {
+                                address: PeerAddress::Ble(id.to_string()),
+                                short_id: None,
+                            };
+                            if tx.unbounded_send(announcement).is_err() {
+                                break;
+                            }
+                        }
+                    }
                     CentralEvent::ServiceDataAdvertisement { id, service_data } => {
                         let data = match service_data.get(&PATHWEAVE_SERVICE_UUID) {
                             Some(d) => d.clone(),
@@ -834,8 +874,14 @@ impl BleTransport {
         payload.extend_from_slice(&short_id);
         svc_data.insert(PATHWEAVE_SERVICE_UUID, payload);
 
+        // services populates the "Complete List of 128-bit Service Class UUIDs" AD type
+        // (0x07). BlueZ's SetDiscoveryFilter UUID check reads that list. service_data
+        // alone produces only AD type 0x21, which BlueZ does not reliably extract into
+        // the device's UUID list on all versions, so the scan filter silently drops the
+        // advertisement and discover() never fires.
         let adv = bluer::adv::Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
+            service_uuids: [PATHWEAVE_SERVICE_UUID].into_iter().collect(),
             service_data: svc_data,
             ..Default::default()
         };
@@ -844,6 +890,7 @@ impl BleTransport {
             .advertise(adv)
             .await
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
+        tracing::debug!("BLE peripheral advertising started");
 
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(peripheral_loop(write_ctrl, notify_ctrl, conn_tx));
