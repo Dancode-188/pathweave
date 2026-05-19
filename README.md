@@ -9,41 +9,47 @@ It's a Rust library that abstracts multiple physical transports behind a single 
 
 The guarantee is connectivity continuity, not performance continuity. A 200-byte field report feels instant over both QUIC and BLE. A 5MB file does not. BLE is a fallback for survival, not for throughput. For the use cases Pathweave is designed for (coordination messages, field reports, status updates, chat) that distinction rarely matters.
 
-**v0.1.0 status:** QUIC transport and BLE central mode (peer discovery) are complete. BLE peripheral mode (advertising, so a device can be discovered and accept connections) is coming in v0.2.0. The `pw-chat` demo works end-to-end over QUIC today.
+**v0.2.0 status:** QUIC transport (with mDNS auto-discovery), BLE peripheral and central mode on all three platforms, at-least-once delivery, and cost-aware routing are complete. The `pw-chat` demo connects two machines over QUIC or BLE, finds peers automatically via mDNS, and falls back between transports as conditions change. Linux and macOS BLE are awaiting hardware verification (#72, #73); Windows BLE is tested.
 
-**Platform support:** Runs on Linux, macOS, and Windows. BLE peripheral mode (v0.2.0) requires Linux with BlueZ.
+**Platform support:** Linux, macOS, and Windows. Linux BLE requires BlueZ. macOS BLE requires Bluetooth permission granted in System Settings.
 
 ---
 
 ## The demo
 
-```
-# Machine A — listen for incoming connections
-cargo run -p pw-chat
-
-# Machine B — connect and start chatting
-cargo run -p pw-chat -- --peer <machine-A-IP>:9001
-```
-
-Both sides get encrypted chat over QUIC with mutual authentication. Neither side sees the other's traffic in plaintext. Neither side can be impersonated.
-
-For bidirectional chat, both sides pass `--peer`:
+**Auto-discovery (recommended):** both sides find each other via mDNS. No configuration needed.
 
 ```
 # Machine A
-cargo run -p pw-chat -- --port 9001 --peer <machine-B-IP>:9001
+cargo run -p pw-chat
 
 # Machine B
-cargo run -p pw-chat -- --port 9001 --peer <machine-A-IP>:9001
+cargo run -p pw-chat
 ```
 
-The BLE fallback (pull the network cable and the conversation keeps going over Bluetooth) is the v0.2.0 demo. That's the moment the library was built for. It's close.
+**Manual mode:** specify the peer address directly.
+
+```
+# Machine A
+cargo run -p pw-chat -- --peer <machine-B-IP>:9001
+
+# Machine B
+cargo run -p pw-chat -- --peer <machine-A-IP>:9001
+```
+
+Both modes give you encrypted chat over QUIC with mutual authentication. Neither side sees the other's traffic in plaintext. Neither side can be impersonated.
+
+Both machines already have BLE registered when running `pw-chat`. If both have Bluetooth hardware and are within range, pull the network cable: the conversation keeps going over Bluetooth. The active transport is shown in the status bar. That handoff is what the library is built for.
 
 ---
 
 ## Using the library
 
-Requires Rust 1.75 or later.
+Requires Rust 1.75 or later. Clone the repository first:
+
+```
+git clone https://github.com/Dancode-188/pathweave && cd pathweave
+```
 
 ```toml
 [dependencies]
@@ -77,8 +83,6 @@ let peer_id = node.connect(PeerAnnouncement {
 node.send(peer_id, b"hello".to_vec()).await?;
 ```
 
-The dependency paths above point to local crates. They will be updated to crates.io paths when Pathweave is published.
-
 ---
 
 ## How it works
@@ -101,7 +105,7 @@ Transports know nothing about crypto or peer identity. The Session layer handles
 
 **You choose the transports. Pathweave chooses the path.** `register_transport()` is entirely in your hands. Register only `QuicTransport` and you get QUIC only. Register both QUIC and BLE and you get automatic fallback. Pathweave never forces a transport on you; it only selects between the ones you've opted into, the same way TCP/IP selects a routing path without asking the application.
 
-**Cost-aware routing.** BLE is `Free`. QUIC is `Metered` (conservative default; we can't distinguish WiFi from mobile data without platform APIs, so we assume metered). The router tries Free transports first and falls back to Metered only if needed.
+**Cost-aware routing.** BLE is `Free`. QUIC is `Free` on WiFi and `Metered` on mobile data (detected via platform APIs). The router tries Free transports first and falls back to Metered only if needed.
 
 **Lazy connections.** The router doesn't hold open connections to every peer. It opens a connection on the best available transport when `send()` is called and closes it after delivery is confirmed.
 
@@ -109,22 +113,26 @@ Transports know nothing about crypto or peer identity. The Session layer handles
 
 ---
 
-## What v0.1.0 includes
+## What v0.2.0 includes
 
 - QUIC transport: full send and receive, Noise_XX mutual auth, length-prefixed framing
+- QUIC mDNS auto-discovery: both sides announce on the local network and connect automatically
+- QUIC cost intelligence: Free on WiFi, Metered on mobile data
+- BLE peripheral mode: advertising on Linux (BlueZ), macOS (CoreBluetooth), and Windows (WinRT)
 - BLE central mode: scanning, peer discovery, GATT connect and message exchange
-- Cost-aware routing: static priority fallback (Free before Metered)
-- `pw-chat`: terminal chat demo that runs on two machines over QUIC
+- At-least-once delivery: message ID framing, deduplication cache, retry on failure
+- Cost-aware routing with WiFi/mobile awareness and multi-address peer support
+- Health monitoring: continuous transport availability polling and automatic re-routing
+- `pw-chat`: split-pane ratatui TUI with mDNS auto-discovery and transport status bar
 - UniFFI bindings layer: the scaffolding for Swift and Kotlin bindings
 
 ---
 
-## What v0.1.0 does not include
+## What v0.2.0 does not include
 
-- **BLE peripheral mode.** A device can scan and connect but not yet advertise itself as discoverable. Coming in v0.2.0. This is what makes the "internet goes down, chat continues" demo possible.
+- **Linux and macOS BLE hardware verification.** The Linux and macOS BLE implementations are correct based on source analysis but have not been confirmed working on physical hardware. Issues #72 and #73 track this. Windows BLE is tested.
 - **WiFi Direct, SMS, USSD.** Designed for, not yet implemented. USSD (works on any GSM phone, no data required) is the long-term differentiator for Sub-Saharan Africa.
-- **At-least-once delivery.** `send()` confirms the receiver got the message on this attempt but does not retry on failure. BPv7 bundle IDs are already in place for this; the retry logic is v0.2.0.
-- **Noise_XK upgrade.** v0.1.0 uses Noise_XX, which reveals both parties' public keys during the handshake. Noise_XK hides the initiator's identity from passive observers and requires a contact registry. That's v0.2.0 once we have one.
+- **Noise_XK upgrade.** v0.2.0 uses Noise_XX, which reveals both parties' public keys during the handshake. Noise_XK hides the initiator's identity from passive observers and requires a contact registry.
 - **Security audit.** Not yet. We're pursuing NLnet/OTF funding for this. See SECURITY.md.
 
 ---

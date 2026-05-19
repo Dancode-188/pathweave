@@ -11,7 +11,7 @@ unless you'd prefer to stay anonymous.
 
 ---
 
-## Security properties (v0.1.0)
+## Security properties (v0.2.0)
 
 What Pathweave actually provides in this version:
 
@@ -28,24 +28,24 @@ handshake. Nobody reading the wire sees the content.
 **Peer identity binding.** A PeerId is derived from the static public key
 (`base58(blake3(public_key))`). You can't impersonate a peer without their private key.
 
+**Replay suppression.** Every message carries an 8-byte ID. The receiver maintains a
+deduplication cache keyed on `(PeerId, message_id)` with a 60-second TTL. A replayed
+message with the same ID from the same peer is ACKed but not delivered to the handler a
+second time, preventing duplicate delivery from the at-least-once retry mechanism.
+
 ---
 
-## What v0.1.0 does not provide
+## What v0.2.0 does not provide
 
 Being clear about this matters.
 
-**Single-attempt confirmed delivery.** `send()` returns `Ok(())` when the receiver has
-acknowledged delivery via a session-level ACK round-trip. There is no automatic retry —
-if the connection fails before the ACK arrives, `send()` returns an error. At-least-once
-delivery with retry is v0.2.0.
-
 **No initiator identity hiding.** We use Noise_XX, where both sides reveal their static
 keys during the handshake. A passive observer who can intercept the handshake learns
-both parties' public keys. Noise_XK (which hides the initiator's identity) is the v0.2.0
-upgrade.
+both parties' public keys. Noise_XK, which hides the initiator's identity from passive
+observers, is a future milestone.
 
 **No group key exchange.** Noise_XX handles 1:1 sessions. There is no MLS or any other
-group key mechanism in v0.1.0.
+group key mechanism in v0.2.0.
 
 **No formal security audit.** Pathweave has not been reviewed by a third-party security
 firm. We're working toward that. See `SECURITY_AUDIT_STATUS` below.
