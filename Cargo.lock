@@ -1623,7 +1623,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pathweave-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "pathweave-transport-ble"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bluer",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "pathweave-transport-quic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "pathweave-uniffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pathweave-core",
  "tokio",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "pw-chat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "crossterm",
