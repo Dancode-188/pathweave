@@ -96,6 +96,7 @@ impl Router {
         peers: &[PeerAnnouncement],
         identity: &NodeIdentity,
         payload: Vec<u8>,
+        peer_id: &PeerId,
     ) -> Result<()> {
         let any_available = self
             .transports
@@ -149,7 +150,13 @@ impl Router {
                 )
                 .await
                 {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        let _ = self.event_tx.send(TransportEvent::MessageDelivered {
+                            peer_id: peer_id.clone(),
+                            transport: entry.transport.kind(),
+                        });
+                        return Ok(());
+                    }
                     Err(e) => tracing::debug!(
                         attempt,
                         transport = entry.transport.name(),
@@ -681,7 +688,12 @@ mod tests {
         });
 
         router
-            .send(&dual_peer(), &sender_id, b"hello".to_vec())
+            .send(
+                &dual_peer(),
+                &sender_id,
+                b"hello".to_vec(),
+                sender_id.peer_id(),
+            )
             .await
             .unwrap();
 
@@ -718,7 +730,12 @@ mod tests {
         });
 
         router
-            .send(&[dummy_peer()], &sender_id, b"hello".to_vec())
+            .send(
+                &[dummy_peer()],
+                &sender_id,
+                b"hello".to_vec(),
+                sender_id.peer_id(),
+            )
             .await
             .unwrap();
 
@@ -756,7 +773,12 @@ mod tests {
         });
 
         router
-            .send(&dual_peer(), &sender_id, b"fallback".to_vec())
+            .send(
+                &dual_peer(),
+                &sender_id,
+                b"fallback".to_vec(),
+                sender_id.peer_id(),
+            )
             .await
             .unwrap();
 
@@ -791,7 +813,12 @@ mod tests {
 
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&dual_peer(), &sender_id, b"ignored".to_vec())
+            .send(
+                &dual_peer(),
+                &sender_id,
+                b"ignored".to_vec(),
+                sender_id.peer_id(),
+            )
             .await;
 
         assert!(
@@ -815,7 +842,12 @@ mod tests {
         let router = Router::new();
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&[dummy_peer()], &sender_id, b"ignored".to_vec())
+            .send(
+                &[dummy_peer()],
+                &sender_id,
+                b"ignored".to_vec(),
+                sender_id.peer_id(),
+            )
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
@@ -842,7 +874,12 @@ mod tests {
         });
 
         router
-            .send(&[dummy_peer()], &sender_id, b"hello".to_vec())
+            .send(
+                &[dummy_peer()],
+                &sender_id,
+                b"hello".to_vec(),
+                sender_id.peer_id(),
+            )
             .await
             .unwrap();
 
@@ -864,7 +901,12 @@ mod tests {
         // No yield: monitoring task has not run, available = false.
         let sender_id = NodeIdentity::generate();
         let result = router
-            .send(&[dummy_peer()], &sender_id, b"ignored".to_vec())
+            .send(
+                &[dummy_peer()],
+                &sender_id,
+                b"ignored".to_vec(),
+                sender_id.peer_id(),
+            )
             .await;
 
         assert!(

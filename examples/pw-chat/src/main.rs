@@ -67,18 +67,14 @@ struct App {
 }
 
 impl App {
-    fn new(
-        local_short_id: String,
-        peer_id: Option<PeerId>,
-        initial_transport: TransportKind,
-    ) -> Self {
+    fn new(local_short_id: String, peer_id: Option<PeerId>) -> Self {
         let peer_short_id = peer_id.as_ref().map(|id| id.to_base58()[..8].to_owned());
         Self {
             messages: Vec::new(),
             input: String::new(),
             peer_id,
             peer_short_id,
-            transport_name: Some(transport_kind_name(initial_transport)),
+            transport_name: None,
             local_short_id,
         }
     }
@@ -177,8 +173,8 @@ async fn run_app(
             }
             maybe_event = node_events.next() => {
                 match maybe_event {
-                    Some(TransportEvent::TransportChanged { to, .. }) => {
-                        app.transport_name = Some(transport_kind_name(to));
+                    Some(TransportEvent::MessageDelivered { transport, .. }) => {
+                        app.transport_name = Some(transport_kind_name(transport));
                     }
                     Some(TransportEvent::PeerConnected(peer_id)) => {
                         let short_id = peer_id.to_base58()[..8].to_owned();
@@ -190,7 +186,7 @@ async fn run_app(
                         let short_id = peer_id.to_base58()[..8].to_owned();
                         app.messages.push(format!("[disconnected] peer: {}", short_id));
                     }
-                    None => {}
+                    Some(_) | None => {}
                 }
             }
             maybe_msg = msg_rx.recv() => {
@@ -237,21 +233,10 @@ async fn main() {
         .expect("failed to create node");
 
     // Subscribe before registering transports to avoid missing the first TransportChanged.
-    let mut events = node.events();
+    let events = node.events();
 
     node.register_transport(Box::new(QuicTransport::new(listen_addr)));
     node.register_transport(Box::new(BleTransport::new()));
-
-    let initial_transport = loop {
-        match events.next().await {
-            Some(TransportEvent::TransportChanged { to, .. }) => break to,
-            None => {
-                eprintln!("error: event stream closed before any transport started");
-                std::process::exit(1);
-            }
-            _ => {}
-        }
-    };
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     node.on_message(Box::new(TuiHandler { tx: msg_tx }));
@@ -276,7 +261,7 @@ async fn main() {
         None
     };
 
-    let app = App::new(local_short_id, initial_peer_id, initial_transport);
+    let app = App::new(local_short_id, initial_peer_id);
 
     // Restore the terminal before printing any panic message, otherwise the
     // shell is left in raw mode with the alternate screen active.
