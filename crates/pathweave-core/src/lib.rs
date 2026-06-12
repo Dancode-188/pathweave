@@ -226,6 +226,13 @@ pub enum TransportEvent {
     },
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    /// Fired after each successful send(), naming the transport that carried the message.
+    /// pw-chat uses this to show which transport actually delivered the last send, not
+    /// which transport started most recently.
+    MessageDelivered {
+        peer_id: PeerId,
+        transport: TransportKind,
+    },
 }
 
 pub trait MessageHandler: Send + Sync {

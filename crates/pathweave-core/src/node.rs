@@ -189,7 +189,7 @@ impl PathweaveNode {
             .cloned()
             .ok_or(PathweaveError::NoTransportAvailable)?;
         self.router
-            .send(&announcements, &self.identity, payload)
+            .send(&announcements, &self.identity, payload, &peer_id)
             .await
     }
 
