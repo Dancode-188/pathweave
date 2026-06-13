@@ -221,6 +221,14 @@ impl PathweaveNode {
     pub fn events(&self) -> BoxStream<'static, TransportEvent> {
         self.router.events()
     }
+
+    /// Returns the stored Curve25519 static public key for `peer_id`, if known.
+    ///
+    /// Populated after every successful handshake. Used by the Noise_XK upgrade path
+    /// and future E2E hop encryption. See ADR 020.
+    pub fn lookup_key(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
+        self.key_registry.lock().unwrap().get(peer_id).copied()
+    }
 }
 
 /// Loops calling transport.accept(). Waits for the transport's start() to complete
@@ -624,7 +632,7 @@ mod tests {
 
         tokio::spawn(async move {
             let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(client_conn)));
-            let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
+            let mut session = Session::initiate(&sender_id, bundled, None).await.unwrap();
             // Prepend the 8-byte message ID as handle_incoming now expects (ADR 011).
             let msg_id: u64 = 0x0102030405060708;
             let mut framed = Vec::with_capacity(8 + b"hello from peer".len());
@@ -804,7 +812,7 @@ mod tests {
             tokio::spawn(async move {
                 let bundled: Box<dyn Connection> =
                     Box::new(BundleLayer::new(Box::new(client_conn)));
-                let mut session = Session::initiate(&sender_id, bundled).await.unwrap();
+                let mut session = Session::initiate(&sender_id, bundled, None).await.unwrap();
                 session.send(&framed).await.unwrap();
                 // Wait for the ACK so handle_incoming has time to process.
                 let _ =

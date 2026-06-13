@@ -1,13 +1,18 @@
 use bytes::Bytes;
 
 use crate::{
-    peer_id_from_public_key, Connection, NodeIdentity, PathweaveError, PeerId, Result, NOISE_PARAMS,
+    peer_id_from_public_key, Connection, NodeIdentity, PathweaveError, PeerId, Result,
+    NOISE_PARAMS, NOISE_XK_PARAMS,
 };
 
 // Maximum Noise protocol message size (spec limit).
 const NOISE_MSG_MAX: usize = 65535;
 
-/// An authenticated, encrypted channel established via Noise_XX_25519_ChaChaPoly_BLAKE2s.
+// Protocol version prefix sent before the first Noise handshake message.
+const PROTO_XX: u8 = 0x00;
+const PROTO_XK: u8 = 0x01;
+
+/// An authenticated, encrypted channel established via Noise_XX or Noise_XK.
 ///
 /// Callers obtain a Session by completing a handshake through `initiate` or `respond`.
 /// After construction the remote peer's identity is known and all traffic is encrypted.
@@ -19,36 +24,63 @@ pub struct Session {
 }
 
 impl Session {
-    /// Performs the Noise_XX handshake as the initiator over `conn`.
+    /// Performs the Noise handshake as the initiator over `conn`.
     ///
-    /// Sends three handshake messages. Panics only if the hardcoded Noise params
-    /// string is invalid (compile-time invariant, not a runtime condition).
-    pub async fn initiate(identity: &NodeIdentity, mut conn: Box<dyn Connection>) -> Result<Self> {
-        let mut state = snow::Builder::new(
-            NOISE_PARAMS
-                .parse()
-                .expect("hardcoded noise params are valid"),
-        )
-        .local_private_key(identity.private_key_bytes())
-        .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
-        .build_initiator()
-        .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+    /// Pass `remote_key = Some(key)` to use Noise_XK when the peer's static public key
+    /// is already known (from the key registry). Pass `None` to use Noise_XX.
+    /// A 1-byte protocol version prefix is sent before the first handshake message so
+    /// the responder builds the matching HandshakeState. See ADR 020.
+    pub async fn initiate(
+        identity: &NodeIdentity,
+        mut conn: Box<dyn Connection>,
+        remote_key: Option<&[u8; 32]>,
+    ) -> Result<Self> {
+        let (prefix, mut state) = match remote_key {
+            Some(key) => {
+                let state = snow::Builder::new(
+                    NOISE_XK_PARAMS
+                        .parse()
+                        .expect("hardcoded noise params are valid"),
+                )
+                .local_private_key(identity.private_key_bytes())
+                .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+                .remote_public_key(key)
+                .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+                .build_initiator()
+                .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+                (PROTO_XK, state)
+            }
+            None => {
+                let state = snow::Builder::new(
+                    NOISE_PARAMS
+                        .parse()
+                        .expect("hardcoded noise params are valid"),
+                )
+                .local_private_key(identity.private_key_bytes())
+                .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+                .build_initiator()
+                .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+                (PROTO_XX, state)
+            }
+        };
+
+        conn.send_bytes(&[prefix]).await?;
 
         let mut buf = vec![0u8; NOISE_MSG_MAX];
 
-        // Message 1: -> e
+        // Message 1: -> e (XX) or -> e, es (XK)
         let n = state
             .write_message(&[], &mut buf)
             .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
         conn.send_bytes(&buf[..n]).await?;
 
-        // Message 2: <- e, ee, s, es
+        // Message 2: <- e, ee, s, es (XX) or <- e, ee, se (XK)
         let msg = conn.recv_bytes().await?;
         state
             .read_message(&msg, &mut buf)
             .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
 
-        // Message 3: -> s, se
+        // Message 3: -> s, se (both XX and XK)
         let n = state
             .write_message(&[], &mut buf)
             .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
@@ -57,10 +89,30 @@ impl Session {
         Self::finish(state, conn)
     }
 
-    /// Performs the Noise_XX handshake as the responder over `conn`.
+    /// Performs the Noise handshake as the responder over `conn`.
+    ///
+    /// Reads the 1-byte protocol version prefix sent by the initiator and builds the
+    /// matching HandshakeState (XX or XK). The three-message exchange is identical
+    /// in both patterns. See ADR 020.
     pub async fn respond(identity: &NodeIdentity, mut conn: Box<dyn Connection>) -> Result<Self> {
+        let prefix_msg = conn.recv_bytes().await?;
+        let prefix = prefix_msg
+            .first()
+            .copied()
+            .ok_or_else(|| PathweaveError::Session("missing protocol prefix byte".into()))?;
+
+        let params_str = match prefix {
+            PROTO_XX => NOISE_PARAMS,
+            PROTO_XK => NOISE_XK_PARAMS,
+            other => {
+                return Err(PathweaveError::Session(format!(
+                    "unknown protocol prefix: {other:#04x}"
+                )));
+            }
+        };
+
         let mut state = snow::Builder::new(
-            NOISE_PARAMS
+            params_str
                 .parse()
                 .expect("hardcoded noise params are valid"),
         )
@@ -71,19 +123,19 @@ impl Session {
 
         let mut buf = vec![0u8; NOISE_MSG_MAX];
 
-        // Message 1: -> e
+        // Message 1: -> e (XX) or -> e, es (XK)
         let msg = conn.recv_bytes().await?;
         state
             .read_message(&msg, &mut buf)
             .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
 
-        // Message 2: <- e, ee, s, es
+        // Message 2: <- e, ee, s, es (XX) or <- e, ee, se (XK)
         let n = state
             .write_message(&[], &mut buf)
             .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
         conn.send_bytes(&buf[..n]).await?;
 
-        // Message 3: -> s, se
+        // Message 3: -> s, se (both XX and XK)
         let msg = conn.recv_bytes().await?;
         state
             .read_message(&msg, &mut buf)
@@ -193,7 +245,7 @@ mod tests {
         let id_b = NodeIdentity::generate();
         let (conn_a, conn_b) = conn_pair();
         let (a, b) = tokio::join!(
-            Session::initiate(&id_a, Box::new(conn_a)),
+            Session::initiate(&id_a, Box::new(conn_a), None),
             Session::respond(&id_b, Box::new(conn_b)),
         );
         (a.unwrap(), b.unwrap())
@@ -205,7 +257,7 @@ mod tests {
         let id_b = NodeIdentity::generate();
         let (conn_a, conn_b) = conn_pair();
         let (session_a, session_b) = tokio::join!(
-            Session::initiate(&id_a, Box::new(conn_a)),
+            Session::initiate(&id_a, Box::new(conn_a), None),
             Session::respond(&id_b, Box::new(conn_b)),
         );
         let session_a = session_a.unwrap();
@@ -220,13 +272,48 @@ mod tests {
         let id_b = NodeIdentity::generate();
         let (conn_a, conn_b) = conn_pair();
         let (session_a, session_b) = tokio::join!(
-            Session::initiate(&id_a, Box::new(conn_a)),
+            Session::initiate(&id_a, Box::new(conn_a), None),
             Session::respond(&id_b, Box::new(conn_b)),
         );
         let session_a = session_a.unwrap();
         let session_b = session_b.unwrap();
         assert_eq!(session_a.peer_id(), id_b.peer_id());
         assert_eq!(session_b.peer_id(), id_a.peer_id());
+    }
+
+    #[tokio::test]
+    async fn xk_handshake_succeeds_with_known_key() {
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let known_key: [u8; 32] = id_b.public_key().try_into().unwrap();
+        let (conn_a, conn_b) = conn_pair();
+        let (session_a, session_b) = tokio::join!(
+            Session::initiate(&id_a, Box::new(conn_a), Some(&known_key)),
+            Session::respond(&id_b, Box::new(conn_b)),
+        );
+        let session_a = session_a.unwrap();
+        let session_b = session_b.unwrap();
+        assert_eq!(session_a.peer_id(), id_b.peer_id());
+        assert_eq!(session_b.peer_id(), id_a.peer_id());
+        assert_eq!(&session_a.remote_static_key()[..], id_b.public_key());
+        assert_eq!(&session_b.remote_static_key()[..], id_a.public_key());
+    }
+
+    #[tokio::test]
+    async fn xk_with_wrong_key_returns_session_error() {
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let id_wrong = NodeIdentity::generate();
+        let wrong_key: [u8; 32] = id_wrong.public_key().try_into().unwrap();
+        let (conn_a, conn_b) = conn_pair();
+        let (result_a, result_b) = tokio::join!(
+            Session::initiate(&id_a, Box::new(conn_a), Some(&wrong_key)),
+            Session::respond(&id_b, Box::new(conn_b)),
+        );
+        assert!(
+            result_a.is_err() || result_b.is_err(),
+            "XK handshake with wrong key must fail on at least one side"
+        );
     }
 
     #[tokio::test]
@@ -268,12 +355,14 @@ mod tests {
         };
 
         // Forward all handshake messages unmodified, then tamper the first transport message.
+        // The initiator sends 3 messages before entering transport mode: the 1-byte protocol
+        // prefix, Noise msg1, and Noise msg3. Count <= 3 passes all three through.
         let relay = tokio::spawn(async move {
             let mut count = 0usize;
             while let Some(msg) = intercept_rx.recv().await {
                 count += 1;
-                if count <= 2 {
-                    // Messages 1 and 3 of XX handshake from initiator: pass through.
+                if count <= 3 {
+                    // Protocol prefix, msg1, and msg3 from initiator: pass through.
                     intercept_tx.send(msg).ok();
                 } else {
                     // First transport message: flip the first byte.
@@ -288,7 +377,7 @@ mod tests {
         });
 
         let (session_a, session_b) = tokio::join!(
-            Session::initiate(&id_a, Box::new(conn_a)),
+            Session::initiate(&id_a, Box::new(conn_a), None),
             Session::respond(&id_b, Box::new(conn_b)),
         );
         let mut session_a = session_a.unwrap();

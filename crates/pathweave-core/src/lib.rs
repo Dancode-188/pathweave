@@ -41,6 +41,7 @@ pub enum PathweaveError {
 // -- identity ------------------------------------------------------------
 
 pub(crate) const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+pub(crate) const NOISE_XK_PARAMS: &str = "Noise_XK_25519_ChaChaPoly_BLAKE2s";
 
 pub(crate) fn peer_id_from_public_key(public_key: &[u8]) -> PeerId {
     PeerId(*blake3::hash(public_key).as_bytes())

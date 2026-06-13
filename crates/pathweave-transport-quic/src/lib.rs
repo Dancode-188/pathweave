@@ -570,7 +570,9 @@ mod tests {
         let client = QuicTransport::new(loopback(0));
         let conn = client.connect(&peer).await.unwrap();
         let bundled = Box::new(BundleLayer::new(conn));
-        let mut session = Session::initiate(&client_identity, bundled).await.unwrap();
+        let mut session = Session::initiate(&client_identity, bundled, None)
+            .await
+            .unwrap();
         session.send(b"hello from quic").await.unwrap();
 
         let received = server_task.await.unwrap();
