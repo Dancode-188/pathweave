@@ -1,3 +1,6 @@
+#![deny(clippy::all)]
+#![forbid(unsafe_code)]
+
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{

@@ -1,3 +1,7 @@
+#![deny(clippy::all)]
+// unsafe is required for macOS CoreBluetooth interop via the objc2 crate.
+// All unsafe blocks are confined to the macos peripheral module below.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

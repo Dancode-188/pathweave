@@ -1,3 +1,6 @@
+#![deny(clippy::all)]
+#![forbid(unsafe_code)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
