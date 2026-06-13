@@ -121,6 +121,10 @@ pub enum TransportEvent {
     },
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    MessageDelivered {
+        peer_id: PeerId,
+        transport: TransportKind,
+    },
 }
 
 pub enum TransportKind {
@@ -129,8 +133,12 @@ pub enum TransportKind {
 }
 ```
 
-`events()` is what powers the "switched to BLE" line in pw-chat. These enums must be
-defined before the UDL is written because they cross the UniFFI boundary.
+`events()` is what powers the status line in pw-chat. `MessageDelivered` fires after
+each confirmed send (after the receiver's ACK round-trip), naming the transport that
+actually carried the message. `TransportChanged` fires when a transport starts or
+restarts; it is not a reliable signal for which transport delivered a specific message.
+These enums must be defined before the UDL is written because they cross the UniFFI
+boundary.
 
 ---
 
@@ -374,10 +382,17 @@ before you connect. Noise_XK requires knowing the responder's key before initiat
 means you can't use it for unknown nearby peers. Noise_XX lets both sides reveal keys
 during the handshake, so you can connect to anyone you discover.
 
-Noise_XK is the v0.3.0 upgrade, once we have a contact and key registry. The pattern
-string changes; the crate doesn't.
+After the handshake, the peer's static public key is known. PeerId is derived here. The
+raw 32-byte Curve25519 key is retained in the session and stored in a key registry on
+`PathweaveNode` (`HashMap<PeerId, [u8; 32]>`). See ADR 020.
 
-After the handshake, the peer's static public key is known. PeerId is derived here.
+Noise_XK is the v0.3.0 upgrade for known peers. Once the key registry has a peer's key,
+subsequent connections use XK instead of XX. XK hides the responder's identity from
+passive observers during the handshake. A 1-byte protocol version prefix before the first
+handshake message signals which pattern is in use so both sides build the correct
+handshake state. The `snow` pattern string changes from
+`Noise_XX_25519_ChaChaPoly_BLAKE2s` to `Noise_XK_25519_ChaChaPoly_BLAKE2s`; nothing
+else in the session layer changes. See ADR 020.
 
 Crate: `snow` v0.10, RustCrypto backends. The underlying primitives (x25519-dalek,
 chacha20poly1305) are independently verified. The ring backend uses hand-optimized
@@ -561,7 +576,7 @@ Being clear about this matters as much as being clear about what it does.
 - No WiFi Direct, SMS, or USSD transports
 - No MLS group key exchange (Noise_XX is 1:1 only)
 - No multi-hop BLE routing (single-hop only)
-- No contact or key registry (Noise_XK upgrade deferred to v0.3.0)
+- No Noise_XK upgrade yet (key registry implemented in v0.3.0; XK handshake path follows)
 - No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
 - No real-time cost change notifications via OS events (health_monitor restart provides

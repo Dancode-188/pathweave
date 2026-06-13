@@ -9,8 +9,8 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    BundleLayer, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, Result,
-    Session, Transport, TransportCost, TransportEvent, TransportKind,
+    BundleLayer, KeyRegistry, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId,
+    Result, Session, Transport, TransportCost, TransportEvent, TransportKind,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
@@ -97,6 +97,7 @@ impl Router {
         identity: &NodeIdentity,
         payload: Vec<u8>,
         peer_id: &PeerId,
+        key_registry: &KeyRegistry,
     ) -> Result<()> {
         let any_available = self
             .transports
@@ -147,6 +148,7 @@ impl Router {
                     identity,
                     &payload,
                     message_id,
+                    key_registry,
                 )
                 .await
                 {
@@ -185,6 +187,7 @@ impl Router {
         &self,
         peers: &[PeerAnnouncement],
         identity: &NodeIdentity,
+        key_registry: &KeyRegistry,
     ) -> Result<PeerId> {
         let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
             .transports
@@ -208,7 +211,9 @@ impl Router {
         });
 
         for (entry, ann) in candidates {
-            if let Ok(peer_id) = try_connect(entry.transport.as_ref(), ann, identity).await {
+            if let Ok(peer_id) =
+                try_connect(entry.transport.as_ref(), ann, identity, key_registry).await
+            {
                 return Ok(peer_id);
             }
         }
@@ -341,11 +346,16 @@ async fn try_connect(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
     identity: &NodeIdentity,
+    key_registry: &KeyRegistry,
 ) -> Result<PeerId> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
     let mut session = Session::initiate(identity, bundled).await?;
     let peer_id = session.peer_id().clone();
+    key_registry
+        .lock()
+        .unwrap()
+        .insert(peer_id.clone(), *session.remote_static_key());
     let _ = session.close().await;
     Ok(peer_id)
 }
@@ -369,6 +379,7 @@ async fn try_send(
     identity: &NodeIdentity,
     payload: &[u8],
     message_id: u64,
+    key_registry: &KeyRegistry,
 ) -> Result<()> {
     let raw = transport.connect(peer).await.map_err(|e| {
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
@@ -379,6 +390,10 @@ async fn try_send(
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: handshake failed");
         e
     })?;
+    key_registry
+        .lock()
+        .unwrap()
+        .insert(session.peer_id().clone(), *session.remote_static_key());
 
     let mut framed = Vec::with_capacity(8 + payload.len());
     framed.extend_from_slice(&message_id.to_be_bytes());
@@ -414,6 +429,7 @@ async fn try_send(
 /// back and waits for the next started -> stopped -> started cycle. The
 /// wait_for(false) step prevents a spin loop on transports whose discover()
 /// returns an empty stream immediately.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn peer_stream(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
@@ -422,6 +438,7 @@ pub(crate) async fn peer_stream(
     known_addrs: Arc<Mutex<HashSet<PeerAddress>>>,
     local_peer_id: PeerId,
     event_tx: broadcast::Sender<TransportEvent>,
+    key_registry: KeyRegistry,
 ) {
     loop {
         let _ = started.wait_for(|v| *v).await;
@@ -434,7 +451,7 @@ pub(crate) async fn peer_stream(
                 continue;
             }
 
-            match try_connect(transport.as_ref(), &announcement, &identity).await {
+            match try_connect(transport.as_ref(), &announcement, &identity, &key_registry).await {
                 Ok(peer_id) if peer_id == local_peer_id => {
                     // Self-discovery: keep addr in known_addrs so we don't retry.
                     tracing::debug!(addr = %addr, "discovered self; skipping");
@@ -465,7 +482,7 @@ pub(crate) async fn peer_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Connection, NodeIdentity, PeerAddress, Session, TransportKind};
+    use crate::{new_key_registry, Connection, NodeIdentity, PeerAddress, Session, TransportKind};
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::atomic::AtomicUsize;
@@ -693,6 +710,7 @@ mod tests {
                 &sender_id,
                 b"hello".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await
             .unwrap();
@@ -735,6 +753,7 @@ mod tests {
                 &sender_id,
                 b"hello".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await
             .unwrap();
@@ -778,6 +797,7 @@ mod tests {
                 &sender_id,
                 b"fallback".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await
             .unwrap();
@@ -818,6 +838,7 @@ mod tests {
                 &sender_id,
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await;
 
@@ -847,6 +868,7 @@ mod tests {
                 &sender_id,
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
@@ -879,6 +901,7 @@ mod tests {
                 &sender_id,
                 b"hello".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await
             .unwrap();
@@ -906,6 +929,7 @@ mod tests {
                 &sender_id,
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
+                &new_key_registry(),
             )
             .await;
 
@@ -941,7 +965,7 @@ mod tests {
         });
 
         let peer_id = router
-            .connect(&[dummy_peer()], &initiator_id)
+            .connect(&[dummy_peer()], &initiator_id, &new_key_registry())
             .await
             .unwrap();
         assert_eq!(peer_id, expected_peer_id);
@@ -951,7 +975,9 @@ mod tests {
     async fn connect_returns_no_transport_when_none_registered() {
         let router = Router::new();
         let identity = NodeIdentity::generate();
-        let result = router.connect(&[dummy_peer()], &identity).await;
+        let result = router
+            .connect(&[dummy_peer()], &identity, &new_key_registry())
+            .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
 
@@ -1192,6 +1218,7 @@ mod tests {
             Arc::clone(&known_addrs),
             local_peer_id,
             event_tx,
+            new_key_registry(),
         ));
 
         // Start the transport: peer_stream calls discover() (first call, empty stream ends).
