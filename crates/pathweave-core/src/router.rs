@@ -429,6 +429,7 @@ async fn try_send(
 /// back and waits for the next started -> stopped -> started cycle. The
 /// wait_for(false) step prevents a spin loop on transports whose discover()
 /// returns an empty stream immediately.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn peer_stream(
     transport: Arc<dyn Transport>,
     identity: NodeIdentity,
