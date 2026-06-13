@@ -7,8 +7,9 @@ use futures::stream::BoxStream;
 use tokio::sync::watch;
 
 use crate::{
-    BundleLayer, Connection, MessageHandler, NodeConfig, NodeIdentity, PathweaveError, PeerAddress,
-    PeerAnnouncement, PeerId, Result, Router, Session, Transport, TransportEvent,
+    new_key_registry, BundleLayer, Connection, KeyRegistry, MessageHandler, NodeConfig,
+    NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, Result, Router, Session,
+    Transport, TransportEvent,
 };
 
 const DEDUP_TTL: Duration = Duration::from_secs(60);
@@ -82,6 +83,7 @@ pub struct PathweaveNode {
     known_addrs: Arc<Mutex<HashSet<PeerAddress>>>,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
+    key_registry: KeyRegistry,
 }
 
 impl PathweaveNode {
@@ -95,6 +97,7 @@ impl PathweaveNode {
             known_addrs: Arc::new(Mutex::new(HashSet::new())),
             handler: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
+            key_registry: new_key_registry(),
         })
     }
 
@@ -119,6 +122,7 @@ impl PathweaveNode {
             handler,
             dedup,
             started.clone(),
+            Arc::clone(&self.key_registry),
         ));
 
         tokio::spawn(crate::router::peer_stream(
@@ -129,6 +133,7 @@ impl PathweaveNode {
             Arc::clone(&self.known_addrs),
             self.identity.peer_id().clone(),
             self.router.event_tx(),
+            Arc::clone(&self.key_registry),
         ));
     }
 
@@ -142,7 +147,11 @@ impl PathweaveNode {
     pub async fn connect(&mut self, announcement: PeerAnnouncement) -> Result<PeerId> {
         let peer_id = self
             .router
-            .connect(std::slice::from_ref(&announcement), &self.identity)
+            .connect(
+                std::slice::from_ref(&announcement),
+                &self.identity,
+                &self.key_registry,
+            )
             .await?;
         self.known_addrs
             .lock()
@@ -189,7 +198,13 @@ impl PathweaveNode {
             .cloned()
             .ok_or(PathweaveError::NoTransportAvailable)?;
         self.router
-            .send(&announcements, &self.identity, payload, &peer_id)
+            .send(
+                &announcements,
+                &self.identity,
+                payload,
+                &peer_id,
+                &self.key_registry,
+            )
             .await
     }
 
@@ -218,6 +233,7 @@ async fn accept_loop(
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
     mut started: watch::Receiver<bool>,
+    key_registry: KeyRegistry,
 ) {
     let _ = started.wait_for(|v| *v).await;
     loop {
@@ -226,7 +242,14 @@ async fn accept_loop(
                 let identity = identity.clone();
                 let handler = Arc::clone(&handler);
                 let dedup = Arc::clone(&dedup);
-                tokio::spawn(handle_incoming(conn, identity, handler, dedup));
+                let key_registry = Arc::clone(&key_registry);
+                tokio::spawn(handle_incoming(
+                    conn,
+                    identity,
+                    handler,
+                    dedup,
+                    key_registry,
+                ));
             }
             Err(e) => {
                 tracing::debug!(transport = transport.name(), "accept error: {}", e);
@@ -248,6 +271,7 @@ async fn handle_incoming(
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
+    key_registry: KeyRegistry,
 ) {
     let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(conn));
     let mut session = match Session::respond(&identity, bundled).await {
@@ -258,6 +282,10 @@ async fn handle_incoming(
         }
     };
     let peer_id = session.peer_id().clone();
+    key_registry
+        .lock()
+        .unwrap()
+        .insert(peer_id.clone(), *session.remote_static_key());
     while let Ok(payload) = session.recv().await {
         if payload.len() < 8 {
             tracing::debug!(peer = %peer_id, "received payload shorter than 8 bytes; skipping");
@@ -638,6 +666,35 @@ mod tests {
         assert_eq!(peer_id, expected_peer_id);
         // Verify the mapping was stored so send() can now route to this peer.
         assert!(node.peers.lock().unwrap().contains_key(&peer_id));
+    }
+
+    #[tokio::test]
+    async fn connect_stores_peer_key_in_registry() {
+        let (mock, mut mock_rx, _) = make_transport(TransportCost::Free, TransportKind::Ble);
+
+        let initiator_id = NodeIdentity::generate();
+        let responder_id = NodeIdentity::generate();
+        let expected_key: [u8; 32] = responder_id.public_key().try_into().unwrap();
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), initiator_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(mock));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        tokio::spawn(async move {
+            let conn = mock_rx.recv().await.unwrap();
+            run_responder(conn, responder_id).await;
+        });
+
+        let peer_id = node.connect(dummy_peer()).await.unwrap();
+        let registry = node.key_registry.lock().unwrap();
+        let stored = registry
+            .get(&peer_id)
+            .expect("key must be in registry after connect");
+        assert_eq!(stored, &expected_key);
     }
 
     #[tokio::test]

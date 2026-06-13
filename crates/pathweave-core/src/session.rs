@@ -13,6 +13,7 @@ const NOISE_MSG_MAX: usize = 65535;
 /// After construction the remote peer's identity is known and all traffic is encrypted.
 pub struct Session {
     peer_id: PeerId,
+    remote_static_key: [u8; 32],
     state: snow::TransportState,
     conn: Box<dyn Connection>,
 }
@@ -92,18 +93,18 @@ impl Session {
     }
 
     fn finish(state: snow::HandshakeState, conn: Box<dyn Connection>) -> Result<Self> {
-        let remote_static = state
-            .get_remote_static()
-            .ok_or_else(|| {
-                PathweaveError::Session("remote static key unavailable after handshake".into())
-            })?
-            .to_vec();
-        let peer_id = peer_id_from_public_key(&remote_static);
+        let raw = state.get_remote_static().ok_or_else(|| {
+            PathweaveError::Session("remote static key unavailable after handshake".into())
+        })?;
+        let remote_static_key: [u8; 32] =
+            raw.try_into().expect("Noise static key is always 32 bytes");
+        let peer_id = peer_id_from_public_key(&remote_static_key);
         let transport = state
             .into_transport_mode()
             .map_err(|e| PathweaveError::Session(e.to_string()))?;
         Ok(Self {
             peer_id,
+            remote_static_key,
             state: transport,
             conn,
         })
@@ -133,6 +134,10 @@ impl Session {
 
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
+    }
+
+    pub fn remote_static_key(&self) -> &[u8; 32] {
+        &self.remote_static_key
     }
 
     pub async fn close(&mut self) -> Result<()> {
@@ -192,6 +197,21 @@ mod tests {
             Session::respond(&id_b, Box::new(conn_b)),
         );
         (a.unwrap(), b.unwrap())
+    }
+
+    #[tokio::test]
+    async fn handshake_reveals_correct_static_key() {
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let (conn_a, conn_b) = conn_pair();
+        let (session_a, session_b) = tokio::join!(
+            Session::initiate(&id_a, Box::new(conn_a)),
+            Session::respond(&id_b, Box::new(conn_b)),
+        );
+        let session_a = session_a.unwrap();
+        let session_b = session_b.unwrap();
+        assert_eq!(&session_a.remote_static_key()[..], id_b.public_key());
+        assert_eq!(&session_b.remote_static_key()[..], id_a.public_key());
     }
 
     #[tokio::test]

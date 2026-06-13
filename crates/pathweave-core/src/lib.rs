@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub mod bundle;
 pub use bundle::BundleLayer;
@@ -258,6 +260,15 @@ pub trait Connection: Send + Sync {
     async fn recv_bytes(&mut self) -> Result<Bytes>;
     async fn close(&mut self) -> Result<()>;
     fn mtu(&self) -> usize;
+}
+
+// -- key registry --------------------------------------------------------
+
+/// Key store for the Noise_XK upgrade path; populated after every handshake. See ADR 020.
+pub(crate) type KeyRegistry = Arc<Mutex<HashMap<PeerId, [u8; 32]>>>;
+
+pub(crate) fn new_key_registry() -> KeyRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 // -- node ----------------------------------------------------------------
