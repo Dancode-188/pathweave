@@ -386,13 +386,17 @@ After the handshake, the peer's static public key is known. PeerId is derived he
 raw 32-byte Curve25519 key is retained in the session and stored in a key registry on
 `PathweaveNode` (`HashMap<PeerId, [u8; 32]>`). See ADR 020.
 
-Noise_XK is the v0.3.0 upgrade for known peers. Once the key registry has a peer's key,
-subsequent connections use XK instead of XX. XK hides the responder's identity from
-passive observers during the handshake. A 1-byte protocol version prefix before the first
-handshake message signals which pattern is in use so both sides build the correct
-handshake state. The `snow` pattern string changes from
-`Noise_XX_25519_ChaChaPoly_BLAKE2s` to `Noise_XK_25519_ChaChaPoly_BLAKE2s`; nothing
-else in the session layer changes. See ADR 020.
+Noise_XK is used for directed sends to known peers (v0.3.0). When the key registry has
+an entry for the target PeerId, `Session::initiate` builds an XK initiator and passes the
+stored key as `remote_public_key`. XK hides the responder's identity from passive
+observers: the first handshake message is encrypted to the responder's static key, so an
+observer learns the initiator's identity (msg3) but not the responder's. Discovery probes
+(`try_connect`) always use XX because the target identity is not known before dialing.
+
+A 1-byte protocol version prefix is sent before the first Noise message: `0x00` for XX,
+`0x01` for XK. `Session::respond` reads the prefix and builds the matching HandshakeState.
+The three-message exchange is structurally identical in both patterns. On XK failure (stale
+key), the registry entry is evicted and the next retry falls through to XX. See ADR 020.
 
 Crate: `snow` v0.10, RustCrypto backends. The underlying primitives (x25519-dalek,
 chacha20poly1305) are independently verified. The ring backend uses hand-optimized
@@ -576,7 +580,7 @@ Being clear about this matters as much as being clear about what it does.
 - No WiFi Direct, SMS, or USSD transports
 - No MLS group key exchange (Noise_XX is 1:1 only)
 - No multi-hop BLE routing (single-hop only)
-- No Noise_XK upgrade yet (key registry implemented in v0.3.0; XK handshake path follows)
+- No key gossip yet (Noise_XK implemented in v0.3.0; gossip via address exchange type 2 follows)
 - No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
 - No real-time cost change notifications via OS events (health_monitor restart provides

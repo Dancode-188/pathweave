@@ -149,6 +149,7 @@ impl Router {
                     &payload,
                     message_id,
                     key_registry,
+                    peer_id,
                 )
                 .await
                 {
@@ -340,6 +341,7 @@ fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
 }
 
 /// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
+/// Always uses Noise_XX because the target identity is unknown before dialing.
 /// The session is closed explicitly so transports that require an active teardown
 /// (e.g. BLE peripheral.disconnect()) release their resources before the next connect.
 async fn try_connect(
@@ -350,7 +352,7 @@ async fn try_connect(
 ) -> Result<PeerId> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
-    let mut session = Session::initiate(identity, bundled).await?;
+    let mut session = Session::initiate(identity, bundled, None).await?;
     let peer_id = session.peer_id().clone();
     key_registry
         .lock()
@@ -373,6 +375,8 @@ fn new_message_id() -> u64 {
 /// Opens a connection through the given transport, wraps it in BundleLayer and
 /// Session, prepends the 8-byte message ID for receiver-side deduplication,
 /// sends the framed payload, waits for the receiver's delivery ACK, then closes.
+/// Uses Noise_XK when the key registry has an entry for peer_id; falls back to
+/// Noise_XX on XK failure and evicts the stale entry so the next retry uses XX.
 async fn try_send(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
@@ -380,16 +384,25 @@ async fn try_send(
     payload: &[u8],
     message_id: u64,
     key_registry: &KeyRegistry,
+    peer_id: &PeerId,
 ) -> Result<()> {
+    let remote_key = key_registry.lock().unwrap().get(peer_id).copied();
     let raw = transport.connect(peer).await.map_err(|e| {
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
         e
     })?;
     let bundled = Box::new(BundleLayer::new(raw));
-    let mut session = Session::initiate(identity, bundled).await.map_err(|e| {
-        tracing::debug!(addr = ?peer.address, error = %e, "try_send: handshake failed");
-        e
-    })?;
+    let mut session = match Session::initiate(identity, bundled, remote_key.as_ref()).await {
+        Ok(s) => s,
+        Err(e) => {
+            if remote_key.is_some() {
+                // XK failed; evict the stale key so the next retry uses XX.
+                key_registry.lock().unwrap().remove(peer_id);
+            }
+            tracing::debug!(addr = ?peer.address, error = %e, "try_send: handshake failed");
+            return Err(e);
+        }
+    };
     key_registry
         .lock()
         .unwrap()
