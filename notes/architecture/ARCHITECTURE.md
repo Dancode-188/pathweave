@@ -314,30 +314,41 @@ The accept loop:
 
 ```
 wait for health_monitor to signal start() success   // prevents startup race
+local_addrs = transport.local_addresses()           // snapshot own addresses for exchange
 loop {
     conn = transport.accept().await
     if error: log, sleep 5 s, retry    // handles transports that don't support inbound
-    spawn handle_incoming(conn)
+    spawn handle_incoming(conn, peers, local_addrs)
 }
 ```
 
 `handle_incoming` runs per-connection:
 
 ```
-BundleLayer::new(conn)               // wraps in bundle framing
-Session::respond(identity, bundled)  // Noise_XX handshake as responder
-peer_id = session.peer_id()          // identity revealed after handshake
-loop:
-    payload = session.recv()         // payload = [message_id: u64 big-endian] ++ [app bytes]
+BundleLayer::new(conn)                   // wraps in bundle framing
+Session::respond(identity, bundled)      // Noise_XX handshake as responder
+peer_id = session.peer_id()             // identity revealed after handshake
+
+first = session.recv()                  // inspect before looping
+if first[0] == 0x00:                    // address exchange control frame (ADR 017)
+    addrs = decode_addr_exchange(first) // parse peer's addresses
+    upsert_peer_addresses(peers, peer_id, addrs)
+    session.send(encode_addr_exchange(local_addrs))  // send own addresses
+    app_payload = session.recv()        // now read the application frame
+else:
+    app_payload = first                 // old peer: first message is the app frame
+
+// process app_payload, then loop for subsequent messages:
+loop on app_payload, then session.recv():
     if payload.len() < 8:
-        session.send(b"")            // ACK malformed frame so sender doesn't hang
+        session.send(b"")              // ACK malformed frame so sender doesn't hang
         continue
-    message_id = payload[0..8]       // extract 8-byte ID prepended by the sender
+    message_id = payload[0..8]         // extract 8-byte ID prepended by the sender
     if dedup_cache.check_and_insert(peer_id, message_id):
-        session.send(b"")            // ACK even on duplicate -- stops the sender retrying
+        session.send(b"")              // ACK even on duplicate -- stops the sender retrying
         continue
     handler.on_message(peer_id, payload[8..])   // deliver app bytes (ID stripped)
-    session.send(b"")                // empty ACK to the sender (see note below)
+    session.send(b"")                   // empty ACK to the sender (see note below)
 ```
 
 **Why the ACK is required:** Quinn's `write_all()` writes to an internal send buffer; actual transmission is async. If the sender drops the session immediately after `send()`, Quinn fires `CONNECTION_CLOSE` before flushing the buffer and the data is silently lost. The receiver's empty ACK keeps the sender's connection alive long enough for the data to be transmitted. `send()` returning `Ok(())` is only meaningful when this round-trip completes. See ADR 009 and issue #34.
@@ -349,6 +360,22 @@ call to `on_message()` but still sends the ACK so the sender stops retrying. Cac
 entries are keyed on `(PeerId, message_id)` and expire after `DEDUP_TTL` (60 seconds).
 Given `MAX_SEND_ATTEMPTS = 3` and `RETRY_BACKOFF = 1s`, the entire retry window is well
 under 60 seconds, so a duplicate will always hit a live cache entry. See ADR 011.
+
+**Why message IDs have the high bit set:** `new_message_id()` sets `bytes[0] |= 0x80`,
+placing all application message IDs in the range 0x80–0xFF for the first byte. This
+reserves the 0x00–0x7F range for control messages. The control space is used for address
+exchange (type `[0,0,0,0,0,0,0,1]`). The deduplication cache operates on the full 8-byte
+ID and is unaffected; the application ID space is 2^63 values, sufficient for dedup
+purposes. See ADR 017.
+
+**Address exchange:** After every Noise handshake, both sides share their currently
+advertised addresses before any application payload flows. The initiator sends an address
+exchange frame (control ID type 1, followed by the count and per-address bytes), then
+waits up to 2 seconds for the responder's reply. `handle_incoming` detects the control
+frame by checking `first[0] == 0x00` and routes accordingly. A node running an older
+version sends an application frame first, which has `first[0] >= 0x80` (guaranteed by the
+high-bit mask above); `handle_incoming` treats it as an application frame directly. This
+is the backwards-compatibility branch. See ADR 017.
 
 The handler is stored as `Arc<Mutex<Option<Box<dyn MessageHandler>>>>`. The Arc is
 cloned into each accept loop task so a single handler registration covers all
@@ -580,7 +607,7 @@ Being clear about this matters as much as being clear about what it does.
 - No WiFi Direct, SMS, or USSD transports
 - No MLS group key exchange (Noise_XX is 1:1 only)
 - No multi-hop BLE routing (single-hop only)
-- No key gossip yet (Noise_XK implemented in v0.3.0; gossip via address exchange type 2 follows)
+- No key gossip yet (address exchange type 1 implemented in v0.3.0; key gossip via type 2 follows)
 - No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
 - No real-time cost change notifications via OS events (health_monitor restart provides

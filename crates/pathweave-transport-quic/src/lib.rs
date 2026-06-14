@@ -54,6 +54,9 @@ pub struct QuicTransport {
     instance_name: String,
     // Detected at start() time; read lock-free by cost(). Encoding: 0=Free, 1=Metered, 2=Unknown.
     cost: AtomicU8,
+    // Set to Some(addr) in start(), cleared to None in stop(). Accessed by the sync
+    // local_addresses() method, so a std::sync::Mutex is used instead of tokio's.
+    started_addr: std::sync::Mutex<Option<SocketAddr>>,
 }
 
 impl QuicTransport {
@@ -67,6 +70,7 @@ impl QuicTransport {
             mdns: std::sync::Mutex::new(None),
             instance_name,
             cost: AtomicU8::new(2), // Unknown until start() detects the interface type
+            started_addr: std::sync::Mutex::new(None),
         }
     }
 
@@ -301,6 +305,7 @@ impl Transport for QuicTransport {
             Endpoint::server(server_config, self.listen_addr).map_err(PathweaveError::Io)?;
         let local_addr = endpoint.local_addr().map_err(PathweaveError::Io)?;
         *self.endpoint.lock().await = Some(endpoint);
+        *self.started_addr.lock().unwrap() = Some(local_addr);
 
         let daemon = ServiceDaemon::new().map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
@@ -371,6 +376,7 @@ impl Transport for QuicTransport {
     }
 
     async fn stop(&self) -> Result<()> {
+        *self.started_addr.lock().unwrap() = None;
         if let Some(ep) = self.endpoint.lock().await.take() {
             ep.close(0u32.into(), b"shutdown");
         }
@@ -468,6 +474,14 @@ impl Transport for QuicTransport {
 
     fn name(&self) -> &'static str {
         "quic"
+    }
+
+    fn local_addresses(&self) -> Vec<PeerAddress> {
+        self.started_addr
+            .lock()
+            .unwrap()
+            .map(|addr| vec![PeerAddress::Quic(addr)])
+            .unwrap_or_default()
     }
 }
 
