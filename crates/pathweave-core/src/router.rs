@@ -494,7 +494,9 @@ pub(crate) fn decode_addr_exchange(bytes: &[u8]) -> Option<Vec<PeerAddress>> {
                 if pos + len > bytes.len() {
                     return None;
                 }
-                let id = std::str::from_utf8(&bytes[pos..pos + len]).ok()?.to_string();
+                let id = std::str::from_utf8(&bytes[pos..pos + len])
+                    .ok()?
+                    .to_string();
                 pos += len;
                 addrs.push(PeerAddress::Ble(id));
             }
@@ -624,8 +626,14 @@ pub(crate) async fn peer_stream(
                 continue;
             }
 
-            match try_connect(transport.as_ref(), &announcement, &identity, &key_registry, &peers)
-                .await
+            match try_connect(
+                transport.as_ref(),
+                &announcement,
+                &identity,
+                &key_registry,
+                &peers,
+            )
+            .await
             {
                 Ok(peer_id) if peer_id == local_peer_id => {
                     // Self-discovery: keep addr in known_addrs so we don't retry.
@@ -1154,7 +1162,12 @@ mod tests {
         });
 
         let peer_id = router
-            .connect(&[dummy_peer()], &initiator_id, &new_key_registry(), &new_peer_table())
+            .connect(
+                &[dummy_peer()],
+                &initiator_id,
+                &new_key_registry(),
+                &new_peer_table(),
+            )
             .await
             .unwrap();
         assert_eq!(peer_id, expected_peer_id);
@@ -1165,7 +1178,12 @@ mod tests {
         let router = Router::new();
         let identity = NodeIdentity::generate();
         let result = router
-            .connect(&[dummy_peer()], &identity, &new_key_registry(), &new_peer_table())
+            .connect(
+                &[dummy_peer()],
+                &identity,
+                &new_key_registry(),
+                &new_peer_table(),
+            )
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }

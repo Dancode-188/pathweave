@@ -316,7 +316,9 @@ async fn handle_incoming(
             Some(addrs) => router::upsert_peer_addresses(&peers, &peer_id, addrs),
             None => tracing::debug!(peer = %peer_id, "addr-exchange: parse failed; skipping"),
         }
-        let _ = session.send(&router::encode_addr_exchange(&local_addrs)).await;
+        let _ = session
+            .send(&router::encode_addr_exchange(&local_addrs))
+            .await;
         match session.recv().await {
             Ok(p) => p,
             Err(_) => return,
