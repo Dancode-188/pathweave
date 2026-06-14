@@ -256,6 +256,9 @@ pub trait Transport: Send + Sync {
     fn cost(&self) -> TransportCost;
     fn kind(&self) -> TransportKind;
     fn name(&self) -> &'static str;
+    fn local_addresses(&self) -> Vec<PeerAddress> {
+        vec![]
+    }
 }
 
 #[async_trait]
@@ -272,6 +275,15 @@ pub trait Connection: Send + Sync {
 pub(crate) type KeyRegistry = Arc<Mutex<HashMap<PeerId, [u8; 32]>>>;
 
 pub(crate) fn new_key_registry() -> KeyRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+// -- peer table ----------------------------------------------------------
+
+/// Shared peer table: PeerId -> known addresses for routing. See ADR 016 and ADR 017.
+pub(crate) type PeerTable = Arc<Mutex<HashMap<PeerId, Vec<PeerAnnouncement>>>>;
+
+pub(crate) fn new_peer_table() -> PeerTable {
     Arc::new(Mutex::new(HashMap::new()))
 }
 

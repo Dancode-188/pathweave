@@ -2,14 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures::stream::BoxStream;
 
 use tokio::sync::watch;
 
 use crate::{
-    new_key_registry, BundleLayer, Connection, KeyRegistry, MessageHandler, NodeConfig,
-    NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, Result, Router, Session,
-    Transport, TransportEvent,
+    new_key_registry, new_peer_table, router, BundleLayer, Connection, KeyRegistry, MessageHandler,
+    NodeConfig, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, PeerTable,
+    Result, Router, Session, Transport, TransportEvent,
 };
 
 const DEDUP_TTL: Duration = Duration::from_secs(60);
@@ -74,7 +75,7 @@ impl DeduplicationCache {
 pub struct PathweaveNode {
     router: Router,
     identity: NodeIdentity,
-    peers: Arc<Mutex<HashMap<PeerId, Vec<PeerAnnouncement>>>>,
+    peers: PeerTable,
     // Dedup-only: tracks addresses currently in-flight or already connected.
     // Not authoritative for routing — peers is. peer_stream only upserts to
     // peers; it never removes. This invariant is what makes the concurrent
@@ -93,7 +94,7 @@ impl PathweaveNode {
         Ok(Self {
             router: Router::new(),
             identity,
-            peers: Arc::new(Mutex::new(HashMap::new())),
+            peers: new_peer_table(),
             known_addrs: Arc::new(Mutex::new(HashSet::new())),
             handler: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
@@ -123,6 +124,7 @@ impl PathweaveNode {
             dedup,
             started.clone(),
             Arc::clone(&self.key_registry),
+            Arc::clone(&self.peers),
         ));
 
         tokio::spawn(crate::router::peer_stream(
@@ -151,6 +153,7 @@ impl PathweaveNode {
                 std::slice::from_ref(&announcement),
                 &self.identity,
                 &self.key_registry,
+                &self.peers,
             )
             .await?;
         self.known_addrs
@@ -204,6 +207,7 @@ impl PathweaveNode {
                 payload,
                 &peer_id,
                 &self.key_registry,
+                &self.peers,
             )
             .await
     }
@@ -242,8 +246,10 @@ async fn accept_loop(
     dedup: Arc<Mutex<DeduplicationCache>>,
     mut started: watch::Receiver<bool>,
     key_registry: KeyRegistry,
+    peers: PeerTable,
 ) {
     let _ = started.wait_for(|v| *v).await;
+    let local_addrs = Arc::new(transport.local_addresses());
     loop {
         match transport.accept().await {
             Ok(conn) => {
@@ -251,12 +257,16 @@ async fn accept_loop(
                 let handler = Arc::clone(&handler);
                 let dedup = Arc::clone(&dedup);
                 let key_registry = Arc::clone(&key_registry);
+                let peers = Arc::clone(&peers);
+                let local_addrs = Arc::clone(&local_addrs);
                 tokio::spawn(handle_incoming(
                     conn,
                     identity,
                     handler,
                     dedup,
                     key_registry,
+                    peers,
+                    local_addrs,
                 ));
             }
             Err(e) => {
@@ -267,19 +277,20 @@ async fn accept_loop(
     }
 }
 
-/// Completes the Noise_XX handshake as the responder, then loops receiving
-/// messages and delivering them to the handler until the connection closes.
-///
-/// Each payload begins with an 8-byte big-endian message ID. The ID is checked
-/// against the deduplication cache: if the (peer_id, message_id) pair was seen
-/// recently, on_message() is skipped. The ACK is sent regardless so the sender
-/// does not time out (see ADR 009 and ADR 011).
+/// Completes the Noise_XX handshake as the responder, then receives and dispatches
+/// messages until the connection closes. The first message is inspected before the
+/// receive loop: if its first byte is 0x00, it is an address exchange control frame
+/// (ADR 017); the exchange is handled and the next message is the application frame.
+/// Otherwise the first message is treated directly as the application frame, which
+/// allows communication with older nodes that do not implement address exchange.
 async fn handle_incoming(
     conn: Box<dyn Connection>,
     identity: NodeIdentity,
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
     key_registry: KeyRegistry,
+    peers: PeerTable,
+    local_addrs: Arc<Vec<PeerAddress>>,
 ) {
     let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(conn));
     let mut session = match Session::respond(&identity, bundled).await {
@@ -294,31 +305,58 @@ async fn handle_incoming(
         .lock()
         .unwrap()
         .insert(peer_id.clone(), *session.remote_static_key());
-    while let Ok(payload) = session.recv().await {
-        if payload.len() < 8 {
-            tracing::debug!(peer = %peer_id, "received payload shorter than 8 bytes; skipping");
-            let _ = session.send(b"").await;
-            continue;
-        }
-        let msg_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
-        ]);
-        let data = payload[8..].to_vec();
 
-        let is_dup = dedup.lock().unwrap().check_and_insert(&peer_id, msg_id);
-        if !is_dup {
-            let guard = handler.lock().unwrap();
-            if let Some(h) = guard.as_ref() {
-                h.on_message(peer_id.clone(), data);
-            }
-        } else {
-            tracing::debug!(peer = %peer_id, "suppressed duplicate message");
+    let first = match session.recv().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let app_payload = if first.len() >= 8 && first[0] == 0x00 {
+        match router::decode_addr_exchange(&first) {
+            Some(addrs) => router::upsert_peer_addresses(&peers, &peer_id, addrs),
+            None => tracing::debug!(peer = %peer_id, "addr-exchange: parse failed; skipping"),
         }
-        // ACK so the sender knows the data was delivered before it tears
-        // down the QUIC connection (see try_send in router.rs and ADR 009).
-        let _ = session.send(b"").await;
+        let _ = session.send(&router::encode_addr_exchange(&local_addrs)).await;
+        match session.recv().await {
+            Ok(p) => p,
+            Err(_) => return,
+        }
+    } else {
+        first
+    };
+
+    dispatch_payload(&peer_id, app_payload, &dedup, &handler, &mut session).await;
+    while let Ok(payload) = session.recv().await {
+        dispatch_payload(&peer_id, payload, &dedup, &handler, &mut session).await;
     }
+}
+
+async fn dispatch_payload(
+    peer_id: &PeerId,
+    payload: Bytes,
+    dedup: &Arc<Mutex<DeduplicationCache>>,
+    handler: &Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
+    session: &mut Session,
+) {
+    if payload.len() < 8 {
+        tracing::debug!(peer = %peer_id, "received payload shorter than 8 bytes; skipping");
+        let _ = session.send(b"").await;
+        return;
+    }
+    let msg_id = u64::from_be_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    let data = payload[8..].to_vec();
+    let is_dup = dedup.lock().unwrap().check_and_insert(peer_id, msg_id);
+    if !is_dup {
+        if let Some(h) = handler.lock().unwrap().as_ref() {
+            h.on_message(peer_id.clone(), data);
+        }
+    } else {
+        tracing::debug!(peer = %peer_id, "suppressed duplicate message");
+    }
+    let _ = session.send(b"").await;
 }
 
 #[cfg(test)]
@@ -507,8 +545,10 @@ mod tests {
     async fn run_responder(conn: TestConn, identity: NodeIdentity) {
         let bundled = Box::new(BundleLayer::new(Box::new(conn)));
         let mut session = Session::respond(&identity, bundled).await.unwrap();
-        let _ = session.recv().await;
-        let _ = session.send(b"").await;
+        let _ = session.recv().await; // addr exchange from initiator
+        let _ = session.send(b"").await; // addr exchange response (empty = no addresses)
+        let _ = session.recv().await; // application frame (absent for try_connect)
+        let _ = session.send(b"").await; // delivery ACK
     }
 
     // -------------------------------------------------------------------------

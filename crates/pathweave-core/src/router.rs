@@ -10,12 +10,14 @@ use tokio::task::JoinHandle;
 
 use crate::{
     BundleLayer, KeyRegistry, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId,
-    Result, Session, Transport, TransportCost, TransportEvent, TransportKind,
+    PeerTable, Result, Session, Transport, TransportCost, TransportEvent, TransportKind,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const ADDR_EXCHANGE_CTRL: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
+const ADDR_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct TransportEntry {
     transport: Arc<dyn Transport>,
@@ -98,6 +100,7 @@ impl Router {
         payload: Vec<u8>,
         peer_id: &PeerId,
         key_registry: &KeyRegistry,
+        peer_table: &PeerTable,
     ) -> Result<()> {
         let any_available = self
             .transports
@@ -150,6 +153,7 @@ impl Router {
                     message_id,
                     key_registry,
                     peer_id,
+                    peer_table,
                 )
                 .await
                 {
@@ -189,6 +193,7 @@ impl Router {
         peers: &[PeerAnnouncement],
         identity: &NodeIdentity,
         key_registry: &KeyRegistry,
+        peer_table: &PeerTable,
     ) -> Result<PeerId> {
         let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
             .transports
@@ -212,8 +217,14 @@ impl Router {
         });
 
         for (entry, ann) in candidates {
-            if let Ok(peer_id) =
-                try_connect(entry.transport.as_ref(), ann, identity, key_registry).await
+            if let Ok(peer_id) = try_connect(
+                entry.transport.as_ref(),
+                ann,
+                identity,
+                key_registry,
+                peer_table,
+            )
+            .await
             {
                 return Ok(peer_id);
             }
@@ -225,6 +236,14 @@ impl Router {
     /// Returns a clone of the event sender so callers can fire events into the same channel.
     pub(crate) fn event_tx(&self) -> broadcast::Sender<TransportEvent> {
         self.event_tx.clone()
+    }
+
+    /// Returns all addresses currently advertised by registered transports.
+    pub fn local_addresses(&self) -> Vec<PeerAddress> {
+        self.transports
+            .iter()
+            .flat_map(|e| e.transport.local_addresses())
+            .collect()
     }
 
     /// Returns a stream of transport lifecycle events.
@@ -342,13 +361,14 @@ fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
 
 /// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
 /// Always uses Noise_XX because the target identity is unknown before dialing.
-/// The session is closed explicitly so transports that require an active teardown
-/// (e.g. BLE peripheral.disconnect()) release their resources before the next connect.
+/// Performs an address exchange after the handshake (ADR 017), then closes the session.
+/// The close is explicit so transports that require active teardown release resources.
 async fn try_connect(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
     identity: &NodeIdentity,
     key_registry: &KeyRegistry,
+    peers: &PeerTable,
 ) -> Result<PeerId> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
@@ -358,25 +378,153 @@ async fn try_connect(
         .lock()
         .unwrap()
         .insert(peer_id.clone(), *session.remote_static_key());
+    let local = transport.local_addresses();
+    let _ = session.send(&encode_addr_exchange(&local)).await;
+    match tokio::time::timeout(ADDR_EXCHANGE_TIMEOUT, session.recv()).await {
+        Ok(Ok(bytes)) => match decode_addr_exchange(&bytes) {
+            Some(addrs) => upsert_peer_addresses(peers, &peer_id, addrs),
+            None => tracing::debug!(peer = %peer_id, "addr-exchange: parse failed; skipping"),
+        },
+        Ok(Err(e)) => tracing::debug!(peer = %peer_id, "addr-exchange recv error: {}", e),
+        Err(_) => tracing::debug!(peer = %peer_id, "addr-exchange: timed out"),
+    }
     let _ = session.close().await;
     Ok(peer_id)
 }
 
 /// Generates a cryptographically random 64-bit message ID from OS entropy.
 ///
+/// The high bit of the first byte is forced to 1, placing all application
+/// message IDs in the range 0x80–0xFF for the first byte. Control messages
+/// use first byte 0x00; the two ranges are non-overlapping. See ADR 017.
+///
 /// Panics if the system entropy source is unavailable — the same condition
 /// that would have already caused NodeIdentity::generate() to panic.
 fn new_message_id() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).expect("system entropy unavailable");
+    bytes[0] |= 0x80;
     u64::from_be_bytes(bytes)
 }
 
+/// Encodes `addrs` into an address exchange control frame (wire format per ADR 017).
+pub(crate) fn encode_addr_exchange(addrs: &[PeerAddress]) -> Vec<u8> {
+    let count = addrs.len().min(255);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&ADDR_EXCHANGE_CTRL);
+    buf.push(count as u8);
+    for addr in addrs.iter().take(255) {
+        match addr {
+            PeerAddress::Quic(sa) => match sa.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    buf.push(0x00);
+                    buf.extend_from_slice(&ip.octets());
+                    buf.extend_from_slice(&sa.port().to_be_bytes());
+                }
+                std::net::IpAddr::V6(ip) => {
+                    buf.push(0x01);
+                    buf.extend_from_slice(&ip.octets());
+                    buf.extend_from_slice(&sa.port().to_be_bytes());
+                }
+            },
+            PeerAddress::Ble(id) => {
+                let bytes = id.as_bytes();
+                let len = bytes.len().min(255) as u8;
+                buf.push(0x02);
+                buf.push(len);
+                buf.extend_from_slice(&bytes[..len as usize]);
+            }
+        }
+    }
+    buf
+}
+
+/// Decodes an address exchange control frame. Returns None on any parse failure.
+/// Unknown control types (bytes[0..8] != ADDR_EXCHANGE_CTRL) also return None.
+pub(crate) fn decode_addr_exchange(bytes: &[u8]) -> Option<Vec<PeerAddress>> {
+    if bytes.len() < 9 || bytes[0..8] != ADDR_EXCHANGE_CTRL {
+        return None;
+    }
+    let count = bytes[8] as usize;
+    let mut pos = 9;
+    let mut addrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= bytes.len() {
+            return None;
+        }
+        match bytes[pos] {
+            0x00 => {
+                pos += 1;
+                if pos + 6 > bytes.len() {
+                    return None;
+                }
+                let ip = std::net::Ipv4Addr::new(
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                );
+                let port = u16::from_be_bytes([bytes[pos + 4], bytes[pos + 5]]);
+                pos += 6;
+                addrs.push(PeerAddress::Quic(std::net::SocketAddr::V4(
+                    std::net::SocketAddrV4::new(ip, port),
+                )));
+            }
+            0x01 => {
+                pos += 1;
+                if pos + 18 > bytes.len() {
+                    return None;
+                }
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes.copy_from_slice(&bytes[pos..pos + 16]);
+                let ip = std::net::Ipv6Addr::from(ip_bytes);
+                let port = u16::from_be_bytes([bytes[pos + 16], bytes[pos + 17]]);
+                pos += 18;
+                addrs.push(PeerAddress::Quic(std::net::SocketAddr::V6(
+                    std::net::SocketAddrV6::new(ip, port, 0, 0),
+                )));
+            }
+            0x02 => {
+                pos += 1;
+                if pos >= bytes.len() {
+                    return None;
+                }
+                let len = bytes[pos] as usize;
+                pos += 1;
+                if pos + len > bytes.len() {
+                    return None;
+                }
+                let id = std::str::from_utf8(&bytes[pos..pos + len]).ok()?.to_string();
+                pos += len;
+                addrs.push(PeerAddress::Ble(id));
+            }
+            _ => return None,
+        }
+    }
+    Some(addrs)
+}
+
+/// Upserts `addrs` into the peer table entry for `peer_id`, deduplicating by address.
+pub(crate) fn upsert_peer_addresses(peers: &PeerTable, peer_id: &PeerId, addrs: Vec<PeerAddress>) {
+    let mut guard = peers.lock().unwrap();
+    let entry = guard.entry(peer_id.clone()).or_default();
+    for addr in addrs {
+        let ann = PeerAnnouncement {
+            address: addr,
+            short_id: None,
+        };
+        if !entry.iter().any(|a| a.address == ann.address) {
+            entry.push(ann);
+        }
+    }
+}
+
 /// Opens a connection through the given transport, wraps it in BundleLayer and
-/// Session, prepends the 8-byte message ID for receiver-side deduplication,
-/// sends the framed payload, waits for the receiver's delivery ACK, then closes.
-/// Uses Noise_XK when the key registry has an entry for peer_id; falls back to
-/// Noise_XX on XK failure and evicts the stale entry so the next retry uses XX.
+/// Session, performs an address exchange (ADR 017), prepends the 8-byte message
+/// ID for receiver-side deduplication, sends the framed payload, and waits for
+/// the receiver's delivery ACK. Uses Noise_XK when the key registry has an entry
+/// for peer_id; falls back to Noise_XX on XK failure and evicts the stale entry.
+#[allow(clippy::too_many_arguments)]
 async fn try_send(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
@@ -385,6 +533,7 @@ async fn try_send(
     message_id: u64,
     key_registry: &KeyRegistry,
     peer_id: &PeerId,
+    peers: &PeerTable,
 ) -> Result<()> {
     let remote_key = key_registry.lock().unwrap().get(peer_id).copied();
     let raw = transport.connect(peer).await.map_err(|e| {
@@ -407,6 +556,17 @@ async fn try_send(
         .lock()
         .unwrap()
         .insert(session.peer_id().clone(), *session.remote_static_key());
+
+    let local = transport.local_addresses();
+    let _ = session.send(&encode_addr_exchange(&local)).await;
+    match tokio::time::timeout(ADDR_EXCHANGE_TIMEOUT, session.recv()).await {
+        Ok(Ok(bytes)) => match decode_addr_exchange(&bytes) {
+            Some(addrs) => upsert_peer_addresses(peers, peer_id, addrs),
+            None => tracing::debug!(peer = %peer_id, "addr-exchange: parse failed; skipping"),
+        },
+        Ok(Err(e)) => tracing::debug!(peer = %peer_id, "addr-exchange recv error: {}", e),
+        Err(_) => tracing::debug!(peer = %peer_id, "addr-exchange: timed out"),
+    }
 
     let mut framed = Vec::with_capacity(8 + payload.len());
     framed.extend_from_slice(&message_id.to_be_bytes());
@@ -464,7 +624,9 @@ pub(crate) async fn peer_stream(
                 continue;
             }
 
-            match try_connect(transport.as_ref(), &announcement, &identity, &key_registry).await {
+            match try_connect(transport.as_ref(), &announcement, &identity, &key_registry, &peers)
+                .await
+            {
                 Ok(peer_id) if peer_id == local_peer_id => {
                     // Self-discovery: keep addr in known_addrs so we don't retry.
                     tracing::debug!(addr = %addr, "discovered self; skipping");
@@ -495,7 +657,10 @@ pub(crate) async fn peer_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{new_key_registry, Connection, NodeIdentity, PeerAddress, Session, TransportKind};
+    use crate::{
+        new_key_registry, new_peer_table, Connection, NodeIdentity, PeerAddress, Session,
+        TransportKind,
+    };
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::atomic::AtomicUsize;
@@ -684,13 +849,17 @@ mod tests {
         ]
     }
 
-    /// Runs a responder: completes the Noise_XX handshake, receives one message, and
-    /// sends an empty ACK so try_send() can return before dropping the connection.
+    /// Runs a responder: completes the Noise_XX handshake, handles the address exchange
+    /// round-trip (ADR 017), receives the application frame, and sends the delivery ACK.
+    /// Extra recv/send calls return errors silently when the initiator used try_connect
+    /// (which closes after the exchange without sending an application frame).
     async fn run_responder(conn: TestConn, identity: NodeIdentity) {
         let bundled = Box::new(BundleLayer::new(Box::new(conn)));
         let mut session = Session::respond(&identity, bundled).await.unwrap();
-        let _ = session.recv().await;
-        let _ = session.send(b"").await;
+        let _ = session.recv().await; // addr exchange from initiator
+        let _ = session.send(b"").await; // addr exchange response (empty = no addresses)
+        let _ = session.recv().await; // application frame (absent for try_connect)
+        let _ = session.send(b"").await; // delivery ACK
     }
 
     #[tokio::test]
@@ -724,6 +893,7 @@ mod tests {
                 b"hello".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await
             .unwrap();
@@ -767,6 +937,7 @@ mod tests {
                 b"hello".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await
             .unwrap();
@@ -811,6 +982,7 @@ mod tests {
                 b"fallback".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await
             .unwrap();
@@ -852,6 +1024,7 @@ mod tests {
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await;
 
@@ -882,6 +1055,7 @@ mod tests {
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
@@ -915,6 +1089,7 @@ mod tests {
                 b"hello".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await
             .unwrap();
@@ -943,6 +1118,7 @@ mod tests {
                 b"ignored".to_vec(),
                 sender_id.peer_id(),
                 &new_key_registry(),
+                &new_peer_table(),
             )
             .await;
 
@@ -978,7 +1154,7 @@ mod tests {
         });
 
         let peer_id = router
-            .connect(&[dummy_peer()], &initiator_id, &new_key_registry())
+            .connect(&[dummy_peer()], &initiator_id, &new_key_registry(), &new_peer_table())
             .await
             .unwrap();
         assert_eq!(peer_id, expected_peer_id);
@@ -989,7 +1165,7 @@ mod tests {
         let router = Router::new();
         let identity = NodeIdentity::generate();
         let result = router
-            .connect(&[dummy_peer()], &identity, &new_key_registry())
+            .connect(&[dummy_peer()], &identity, &new_key_registry(), &new_peer_table())
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
     }
