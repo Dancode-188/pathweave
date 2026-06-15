@@ -40,6 +40,8 @@ struct MdnsState {
     service_fullname: String,
     // Taken by discover() on first call; None afterwards.
     announce_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerAnnouncement>>,
+    // Taken by departures() on first call; None afterwards.
+    departure_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerAddress>>,
     bridge: tokio::task::JoinHandle<()>,
 }
 
@@ -330,26 +332,47 @@ impl Transport for QuicTransport {
             .browse(SERVICE_TYPE)
             .map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
-        // Bridge: drains flume ServiceEvents into a tokio mpsc channel so that
-        // discover() can return a BoxStream<'static, PeerAnnouncement> without
-        // borrowing from self.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerAnnouncement>();
+        // Bridge: drains flume ServiceEvents into two tokio mpsc channels.
+        // announce_tx carries PeerAnnouncement for discover(); dep_tx carries
+        // PeerAddress for departures(). The bridge tracks fullname -> Vec<SocketAddr>
+        // internally because ServiceRemoved only provides the fullname, not the
+        // address, so we must look up the address from the prior ServiceResolved.
+        let (announce_tx, announce_rx) = tokio::sync::mpsc::unbounded_channel::<PeerAnnouncement>();
+        let (dep_tx, dep_rx) = tokio::sync::mpsc::unbounded_channel::<PeerAddress>();
         let bridge = tokio::spawn(async move {
+            let mut resolved: std::collections::HashMap<String, Vec<SocketAddr>> =
+                std::collections::HashMap::new();
             while let Ok(event) = browse_rx.recv_async().await {
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    let port = info.get_port();
-                    for ip in info.get_addresses_v4() {
-                        let addr = SocketAddr::new(IpAddr::V4(*ip), port);
-                        if tx
-                            .send(PeerAnnouncement {
-                                address: PeerAddress::Quic(addr),
-                                short_id: None,
-                            })
-                            .is_err()
-                        {
-                            return;
+                match event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        let port = info.get_port();
+                        let fullname = info.get_fullname().to_string();
+                        let mut addrs = Vec::new();
+                        for ip in info.get_addresses_v4() {
+                            let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+                            addrs.push(addr);
+                            if announce_tx
+                                .send(PeerAnnouncement {
+                                    address: PeerAddress::Quic(addr),
+                                    short_id: None,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        resolved.insert(fullname, addrs);
+                    }
+                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                        if let Some(addrs) = resolved.remove(&fullname) {
+                            for addr in addrs {
+                                if dep_tx.send(PeerAddress::Quic(addr)).is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
         });
@@ -357,7 +380,8 @@ impl Transport for QuicTransport {
         *self.mdns.lock().unwrap() = Some(MdnsState {
             daemon,
             service_fullname,
-            announce_rx: Some(rx),
+            announce_rx: Some(announce_rx),
+            departure_rx: Some(dep_rx),
             bridge,
         });
 
@@ -482,6 +506,22 @@ impl Transport for QuicTransport {
             .unwrap()
             .map(|addr| vec![PeerAddress::Quic(addr)])
             .unwrap_or_default()
+    }
+
+    fn departures(&self) -> BoxStream<'static, PeerAddress> {
+        let rx = self
+            .mdns
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|state| state.departure_rx.take());
+
+        match rx {
+            Some(rx) => Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|addr| (addr, rx))
+            })),
+            None => Box::pin(futures::stream::empty()),
+        }
     }
 }
 

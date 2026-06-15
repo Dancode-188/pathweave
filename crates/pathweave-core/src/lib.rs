@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -258,6 +258,15 @@ pub trait Transport: Send + Sync {
     fn name(&self) -> &'static str;
     fn local_addresses(&self) -> Vec<PeerAddress> {
         vec![]
+    }
+
+    /// Returns a stream of addresses that have departed the discovery layer.
+    ///
+    /// Fires when a previously resolved peer stops advertising (e.g. mDNS record
+    /// expires). The default returns an empty stream for transports that have no
+    /// departure signal.
+    fn departures(&self) -> BoxStream<'static, PeerAddress> {
+        Box::pin(stream::empty())
     }
 }
 

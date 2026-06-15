@@ -591,19 +591,25 @@ async fn try_send(
     }
 }
 
+enum PeerEvent {
+    Arrival(PeerAnnouncement),
+    Departure(PeerAddress),
+}
+
 /// Drives peer discovery for a single transport across restarts.
 ///
-/// Waits for the transport to start, then drains its discover() stream. For
-/// each announced address that is not already in `known_addrs`, performs a
-/// Noise_XX handshake to learn the remote PeerId. On success, upserts the
-/// PeerId -> PeerAnnouncement mapping into the shared peer table. On failure,
-/// removes the address from `known_addrs` so the next re-announcement retries.
-/// Skips self-announcements by comparing the remote PeerId with `local_peer_id`.
+/// Waits for the transport to start, then drains discover() and departures()
+/// concurrently via stream::select. For each announced address not already in
+/// `known_addrs`, performs a Noise_XX handshake to learn the remote PeerId;
+/// on success upserts the mapping and fires PeerConnected. On handshake failure,
+/// removes from `known_addrs` so the next re-announcement retries. Skips
+/// self-announcements. For each departed address, finds the owning PeerId in the
+/// peer table, removes from `known_addrs` so re-discovery works if the peer
+/// returns, and fires PeerDisconnected.
 ///
-/// When the discover stream ends (transport stopped by health_monitor), loops
-/// back and waits for the next started -> stopped -> started cycle. The
-/// wait_for(false) step prevents a spin loop on transports whose discover()
-/// returns an empty stream immediately.
+/// The combined stream ends when both discover() and departures() are exhausted
+/// (transport stopped by health_monitor). The wait_for(false) step prevents a
+/// spin loop on transports whose streams return immediately.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn peer_stream(
     transport: Arc<dyn Transport>,
@@ -617,47 +623,67 @@ pub(crate) async fn peer_stream(
 ) {
     loop {
         let _ = started.wait_for(|v| *v).await;
-        let mut discover = transport.discover();
-        while let Some(announcement) = discover.next().await {
-            let addr = announcement.address.clone();
+        let arrivals = transport.discover().map(PeerEvent::Arrival);
+        let departures = transport.departures().map(PeerEvent::Departure);
+        let mut combined = stream::select(arrivals, departures);
+        while let Some(event) = combined.next().await {
+            match event {
+                PeerEvent::Arrival(announcement) => {
+                    let addr = announcement.address.clone();
 
-            // Skip re-announcements from already-connected addresses (O(1) check).
-            if !known_addrs.lock().unwrap().insert(addr.clone()) {
-                continue;
-            }
+                    // Skip re-announcements from already-connected addresses (O(1) check).
+                    if !known_addrs.lock().unwrap().insert(addr.clone()) {
+                        continue;
+                    }
 
-            match try_connect(
-                transport.as_ref(),
-                &announcement,
-                &identity,
-                &key_registry,
-                &peers,
-            )
-            .await
-            {
-                Ok(peer_id) if peer_id == local_peer_id => {
-                    // Self-discovery: keep addr in known_addrs so we don't retry.
-                    tracing::debug!(addr = %addr, "discovered self; skipping");
+                    match try_connect(
+                        transport.as_ref(),
+                        &announcement,
+                        &identity,
+                        &key_registry,
+                        &peers,
+                    )
+                    .await
+                    {
+                        Ok(peer_id) if peer_id == local_peer_id => {
+                            // Self-discovery: keep addr in known_addrs so we don't retry.
+                            tracing::debug!(addr = %addr, "discovered self; skipping");
+                        }
+                        Ok(peer_id) => {
+                            tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
+                            peers
+                                .lock()
+                                .unwrap()
+                                .entry(peer_id.clone())
+                                .or_default()
+                                .push(announcement);
+                            let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
+                        }
+                        Err(e) => {
+                            tracing::debug!(addr = %addr, "handshake failed: {}", e);
+                            // Remove so we retry on the next re-announcement.
+                            known_addrs.lock().unwrap().remove(&addr);
+                        }
+                    }
                 }
-                Ok(peer_id) => {
-                    tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
-                    peers
-                        .lock()
-                        .unwrap()
-                        .entry(peer_id.clone())
-                        .or_default()
-                        .push(announcement);
-                    let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
-                }
-                Err(e) => {
-                    tracing::debug!(addr = %addr, "handshake failed: {}", e);
-                    // Remove so we retry on the next re-announcement.
-                    known_addrs.lock().unwrap().remove(&addr);
+                PeerEvent::Departure(addr) => {
+                    let peer_id = peers.lock().unwrap().iter().find_map(|(pid, anns)| {
+                        if anns.iter().any(|a| a.address == addr) {
+                            Some(pid.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(peer_id) = peer_id {
+                        known_addrs.lock().unwrap().remove(&addr);
+                        tracing::debug!(addr = %addr, peer = %peer_id, "peer departed");
+                        let _ = event_tx.send(TransportEvent::PeerDisconnected(peer_id));
+                    }
                 }
             }
         }
-        // Stream ended (transport stopped). Wait for the stopped signal before
-        // looping so we don't spin if discover() returns an empty stream.
+        // Combined stream ended (both discover and departures exhausted). Wait
+        // for the stopped signal before looping to avoid spinning.
         let _ = started.wait_for(|v| !v).await;
     }
 }
@@ -1447,6 +1473,119 @@ mod tests {
             discover_calls.load(Ordering::Relaxed),
             2,
             "discover() must be called again after a restart cycle"
+        );
+    }
+
+    // --- peer_stream departure test -------------------------------------------
+
+    struct DepartureOnlyTransport {
+        departure_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PeerAddress>>>,
+    }
+
+    #[async_trait]
+    impl Transport for DepartureOnlyTransport {
+        async fn start(&self, _: &NodeIdentity) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
+            Box::pin(stream::empty())
+        }
+        fn departures(&self) -> BoxStream<'static, PeerAddress> {
+            let rx = self.departure_rx.lock().unwrap().take();
+            match rx {
+                Some(rx) => Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|a| (a, rx))
+                })),
+                None => Box::pin(stream::empty()),
+            }
+        }
+        async fn connect(&self, _: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
+            Err(PathweaveError::Transport("not used".into()))
+        }
+        async fn accept(&self) -> Result<Box<dyn Connection>> {
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+        fn mtu_hint(&self) -> usize {
+            65535
+        }
+        fn cost(&self) -> TransportCost {
+            TransportCost::Free
+        }
+        fn kind(&self) -> TransportKind {
+            TransportKind::Quic
+        }
+        fn name(&self) -> &'static str {
+            "departure-only"
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stream_fires_disconnected_on_departure() {
+        // Verify that a departure from the discovery layer fires PeerDisconnected.
+        // The peer table is pre-populated (simulating a prior successful handshake).
+        // No arrival stream is needed; departure-only mock drives the test.
+        let (dep_tx, dep_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(DepartureOnlyTransport {
+            departure_rx: std::sync::Mutex::new(Some(dep_rx)),
+        });
+
+        let (started_tx, started_rx) = watch::channel(false);
+        let peers: Arc<Mutex<HashMap<PeerId, Vec<PeerAnnouncement>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let known_addrs = Arc::new(Mutex::new(HashSet::new()));
+        let local_peer_id = NodeIdentity::generate().peer_id().clone();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+
+        // Pre-populate the peer table as if try_connect had already succeeded.
+        let remote_peer_id = PeerId::from_bytes([7u8; 32]);
+        let departing_addr = PeerAddress::Quic("127.0.0.1:9099".parse().unwrap());
+        peers.lock().unwrap().insert(
+            remote_peer_id.clone(),
+            vec![PeerAnnouncement {
+                address: departing_addr.clone(),
+                short_id: None,
+            }],
+        );
+        known_addrs.lock().unwrap().insert(departing_addr.clone());
+
+        tokio::spawn(peer_stream(
+            transport,
+            NodeIdentity::generate(),
+            started_rx,
+            Arc::clone(&peers),
+            Arc::clone(&known_addrs),
+            local_peer_id,
+            event_tx,
+            new_key_registry(),
+        ));
+
+        // Start the transport so peer_stream enters the combined stream loop.
+        let _ = started_tx.send(true);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Inject the departure event.
+        dep_tx.send(departing_addr.clone()).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv()).await {
+            Ok(Ok(TransportEvent::PeerDisconnected(pid))) => {
+                assert_eq!(pid, remote_peer_id);
+            }
+            Ok(Ok(other)) => panic!("expected PeerDisconnected, got: {other:?}"),
+            Ok(Err(e)) => panic!("event channel error: {e}"),
+            Err(_) => panic!("timed out waiting for PeerDisconnected"),
+        }
+
+        // The departed address must be removed from known_addrs so re-discovery works.
+        assert!(
+            !known_addrs.lock().unwrap().contains(&departing_addr),
+            "departed address must be removed from known_addrs"
         );
     }
 }

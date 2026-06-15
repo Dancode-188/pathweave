@@ -307,8 +307,18 @@ See the delivery guarantees section.
 `register_transport()` on `PathweaveNode` does three things: registers the transport
 with the Router (which starts its `health_monitor` task), spawns an `accept_loop` task
 that delivers incoming connections to the message handler, and spawns a `peer_stream`
-task that drives `discover()` and populates the peer table for outbound routing. All
-three tasks run for the lifetime of the node.
+task that drives `discover()` and `departures()` to populate the peer table and fire
+lifecycle events. All three tasks run for the lifetime of the node.
+
+`peer_stream` drains arrivals from `Transport::discover()` and departures from
+`Transport::departures()` concurrently using `stream::select`. For each arriving address
+not already in `known_addrs`, it performs a Noise_XX handshake to learn the remote
+PeerId, upserts the mapping, and fires `PeerConnected`. For each departing address, it
+looks up the owning PeerId in the peer table, removes the address from `known_addrs`
+(so re-discovery works if the peer returns), and fires `PeerDisconnected`. The combined
+stream ends when both sub-streams are exhausted, which happens when the transport stops.
+Firing `PeerDisconnected` from session closure would be wrong: sessions are per-message
+and ephemeral. The correct signal is peer absence from the discovery layer.
 
 The accept loop:
 
