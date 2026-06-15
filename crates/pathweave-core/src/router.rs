@@ -31,7 +31,7 @@ struct TransportEntry {
 /// task per transport tracks availability so send() always reflects current state.
 /// Connections are lazy: opened on send(), closed after.
 pub struct Router {
-    transports: Vec<TransportEntry>,
+    transports: std::sync::Mutex<Vec<TransportEntry>>,
     event_tx: broadcast::Sender<TransportEvent>,
 }
 
@@ -39,7 +39,7 @@ impl Router {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {
-            transports: Vec::new(),
+            transports: std::sync::Mutex::new(Vec::new()),
             event_tx,
         }
     }
@@ -52,7 +52,7 @@ impl Router {
     /// returned receiver. Unlike `Notify`, a watch receiver that arrives late
     /// still sees `true` because the value is retained.
     pub fn register_transport(
-        &mut self,
+        &self,
         transport: Arc<dyn Transport>,
         identity: Arc<NodeIdentity>,
     ) -> watch::Receiver<bool> {
@@ -71,7 +71,7 @@ impl Router {
             kind,
         ));
 
-        self.transports.push(TransportEntry {
+        self.transports.lock().unwrap().push(TransportEntry {
             transport,
             available,
             task,
@@ -93,6 +93,7 @@ impl Router {
     /// Returns NoTransportAvailable if no transport is currently available or no
     /// registered transport can handle any of the given addresses.
     /// Returns DeliveryFailed if all attempts are exhausted without a delivery ACK.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
         peers: &[PeerAnnouncement],
@@ -101,52 +102,57 @@ impl Router {
         peer_id: &PeerId,
         key_registry: &KeyRegistry,
         peer_table: &PeerTable,
+        message_id: Option<u64>,
     ) -> Result<()> {
         let any_available = self
             .transports
+            .lock()
+            .unwrap()
             .iter()
             .any(|t| t.available.load(Ordering::Acquire));
         if !any_available {
             return Err(PathweaveError::NoTransportAvailable);
         }
 
-        let message_id = new_message_id();
+        let message_id = message_id.unwrap_or_else(new_message_id);
 
         for attempt in 0..MAX_SEND_ATTEMPTS {
-            let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
-                .transports
-                .iter()
-                .filter(|t| t.available.load(Ordering::Acquire))
-                .flat_map(|entry| {
-                    peers.iter().filter_map(move |ann| {
-                        if ann.address.kind() == entry.transport.kind() {
-                            Some((entry, ann))
-                        } else {
-                            None
-                        }
+            let mut candidates: Vec<(Arc<dyn Transport>, PeerAnnouncement)> = {
+                let guard = self.transports.lock().unwrap();
+                guard
+                    .iter()
+                    .filter(|t| t.available.load(Ordering::Acquire))
+                    .flat_map(|entry| {
+                        peers.iter().filter_map(move |ann| {
+                            if ann.address.kind() == entry.transport.kind() {
+                                Some((Arc::clone(&entry.transport), ann.clone()))
+                            } else {
+                                None
+                            }
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            };
 
             if candidates.is_empty() {
                 return Err(PathweaveError::NoTransportAvailable);
             }
 
-            candidates.sort_by_key(|(entry, _)| match entry.transport.cost() {
+            candidates.sort_by_key(|(transport, _)| match transport.cost() {
                 TransportCost::Free => 0u8,
                 TransportCost::Metered => 1,
                 TransportCost::Unknown => 2,
             });
 
-            for (entry, ann) in &candidates {
+            for (transport, ann) in &candidates {
                 tracing::debug!(
                     attempt,
-                    transport = entry.transport.name(),
+                    transport = transport.name(),
                     addr = ?ann.address,
                     "try_send attempt"
                 );
                 match try_send(
-                    entry.transport.as_ref(),
+                    transport.as_ref(),
                     ann,
                     identity,
                     &payload,
@@ -160,13 +166,13 @@ impl Router {
                     Ok(()) => {
                         let _ = self.event_tx.send(TransportEvent::MessageDelivered {
                             peer_id: peer_id.clone(),
-                            transport: entry.transport.kind(),
+                            transport: transport.kind(),
                         });
                         return Ok(());
                     }
                     Err(e) => tracing::debug!(
                         attempt,
-                        transport = entry.transport.name(),
+                        transport = transport.name(),
                         addr = ?ann.address,
                         error = %e,
                         "try_send failed"
@@ -195,36 +201,32 @@ impl Router {
         key_registry: &KeyRegistry,
         peer_table: &PeerTable,
     ) -> Result<PeerId> {
-        let mut candidates: Vec<(&TransportEntry, &PeerAnnouncement)> = self
-            .transports
-            .iter()
-            .filter(|t| t.available.load(Ordering::Acquire))
-            .flat_map(|entry| {
-                peers.iter().filter_map(move |ann| {
-                    if ann.address.kind() == entry.transport.kind() {
-                        Some((entry, ann))
-                    } else {
-                        None
-                    }
+        let mut candidates: Vec<(Arc<dyn Transport>, PeerAnnouncement)> = {
+            let guard = self.transports.lock().unwrap();
+            guard
+                .iter()
+                .filter(|t| t.available.load(Ordering::Acquire))
+                .flat_map(|entry| {
+                    peers.iter().filter_map(move |ann| {
+                        if ann.address.kind() == entry.transport.kind() {
+                            Some((Arc::clone(&entry.transport), ann.clone()))
+                        } else {
+                            None
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
 
-        candidates.sort_by_key(|(entry, _)| match entry.transport.cost() {
+        candidates.sort_by_key(|(transport, _)| match transport.cost() {
             TransportCost::Free => 0u8,
             TransportCost::Metered => 1,
             TransportCost::Unknown => 2,
         });
 
-        for (entry, ann) in candidates {
-            if let Ok(peer_id) = try_connect(
-                entry.transport.as_ref(),
-                ann,
-                identity,
-                key_registry,
-                peer_table,
-            )
-            .await
+        for (transport, ann) in candidates {
+            if let Ok(peer_id) =
+                try_connect(transport.as_ref(), &ann, identity, key_registry, peer_table).await
             {
                 return Ok(peer_id);
             }
@@ -241,6 +243,8 @@ impl Router {
     /// Returns all addresses currently advertised by registered transports.
     pub fn local_addresses(&self) -> Vec<PeerAddress> {
         self.transports
+            .lock()
+            .unwrap()
             .iter()
             .flat_map(|e| e.transport.local_addresses())
             .collect()
@@ -269,7 +273,7 @@ impl Default for Router {
 
 impl Drop for Router {
     fn drop(&mut self) {
-        for entry in &self.transports {
+        for entry in self.transports.lock().unwrap().iter() {
             entry.task.abort();
         }
     }
@@ -400,7 +404,7 @@ async fn try_connect(
 ///
 /// Panics if the system entropy source is unavailable — the same condition
 /// that would have already caused NodeIdentity::generate() to panic.
-fn new_message_id() -> u64 {
+pub(crate) fn new_message_id() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).expect("system entropy unavailable");
     bytes[0] |= 0x80;
@@ -905,7 +909,7 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(ble, Arc::clone(&identity));
         router.register_transport(quic, Arc::clone(&identity));
 
@@ -928,6 +932,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await
             .unwrap();
@@ -948,7 +953,7 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(ble, Arc::clone(&identity));
         router.register_transport(quic, Arc::clone(&identity));
 
@@ -972,6 +977,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await
             .unwrap();
@@ -994,7 +1000,7 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, false);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(ble, Arc::clone(&identity));
         router.register_transport(quic, Arc::clone(&identity));
 
@@ -1017,6 +1023,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await
             .unwrap();
@@ -1043,7 +1050,7 @@ mod tests {
             make_transport(TransportCost::Metered, TransportKind::Quic, true);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(ble, Arc::clone(&identity));
         router.register_transport(quic, Arc::clone(&identity));
 
@@ -1059,6 +1066,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await;
 
@@ -1090,6 +1098,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await;
         assert!(matches!(result, Err(PathweaveError::NoTransportAvailable)));
@@ -1102,7 +1111,7 @@ mod tests {
             make_transport_with_failures(TransportCost::Free, TransportKind::Ble, 1);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(transport, Arc::clone(&identity));
 
         tokio::task::yield_now().await;
@@ -1124,6 +1133,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await
             .unwrap();
@@ -1140,7 +1150,7 @@ mod tests {
             make_transport(TransportCost::Free, TransportKind::Ble, false);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(ble, Arc::clone(&identity));
 
         // No yield: monitoring task has not run, available = false.
@@ -1153,6 +1163,7 @@ mod tests {
                 sender_id.peer_id(),
                 &new_key_registry(),
                 &new_peer_table(),
+                None,
             )
             .await;
 
@@ -1172,7 +1183,7 @@ mod tests {
         let (transport, mut rx, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
 
         let identity = Arc::new(NodeIdentity::generate());
-        let mut router = Router::new();
+        let router = Router::new();
         router.register_transport(transport, Arc::clone(&identity));
 
         tokio::task::yield_now().await;

@@ -78,7 +78,7 @@ node.on_message(handler); // handler implements MessageHandler (see below)
 let mut events = node.events(); // Stream<Item = TransportEvent>
 ```
 
-**Rust-only (three, not in the UDL):**
+**Rust-only (four, not in the UDL):**
 
 ```rust
 // register a transport before first use
@@ -90,6 +90,10 @@ node.connect(announcement).await?;
 
 // inject a known peer address (e.g. QUIC --peer <address> from the command line)
 node.add_peer(peer_id, announcement);
+
+// send a message via mesh routing to a peer that may not be directly reachable
+// floods to all known neighbors with TTL=7; intermediate nodes relay until dest receives
+node.send_routed(peer_id, payload).await?;
 ```
 
 `connect()` tries transports in cost order (Free first). It returns the PeerId learned
@@ -254,7 +258,7 @@ level, signal quality, and payload-size routing are deferred beyond v0.2.0.
 
 ## The routing layer
 
-Static priority fallback. That's what it is and what we call it.
+Static priority fallback plus TTL-limited mesh flooding.
 
 **Peer table:** `HashMap<PeerId, Vec<PeerAnnouncement>>`. A peer discovered via both
 mDNS (QUIC address) and BLE scan (BLE address) accumulates both addresses in its Vec.
@@ -299,6 +303,27 @@ candidate list (all matching transport-address pairs in cost order), tries every
 in the list, then backs off for 1 second (`RETRY_BACKOFF`) before the next attempt. If
 all attempts across all candidates fail, `send()` returns `PathweaveError::DeliveryFailed`.
 See the delivery guarantees section.
+
+**Mesh routing**
+
+`send_routed(dest_peer_id, payload)` sends a message that may travel through intermediate
+relay nodes. The caller supplies the destination PeerId; the node floods the message to all
+known direct peers with TTL=7. Each relay decrements TTL and floods to all its known peers
+except the immediate sender. When the destination receives the message, it delivers to
+`on_message` and stops forwarding. TTL=0 causes a silent drop.
+
+The wire format adds a `route_flag` byte after the 8-byte message ID:
+- `0x00` — direct message; payload follows immediately (used by `send()`)
+- `0x01` — routed message; 32-byte dest_peer_id, 1-byte TTL, then payload follow
+
+Deduplication for routed messages is keyed on `message_id` alone (not
+`(sender_peer_id, message_id)`) because the immediate sender is a relay and varies
+across paths. Maximum TTL is 7; nodes clamp any received TTL to 7 before decrementing.
+See ADR 019 for the full specification.
+
+A node registered with multiple transports acts as a cross-transport bridge automatically:
+when it relays a routed message, `Router::send()` selects the best available transport
+for the next-hop peer. No explicit bridge configuration is required.
 
 ---
 
@@ -350,15 +375,29 @@ else:
 
 // process app_payload, then loop for subsequent messages:
 loop on app_payload, then session.recv():
-    if payload.len() < 8:
+    if payload.len() < 9:
         session.send(b"")              // ACK malformed frame so sender doesn't hang
         continue
     message_id = payload[0..8]         // extract 8-byte ID prepended by the sender
-    if dedup_cache.check_and_insert(peer_id, message_id):
-        session.send(b"")              // ACK even on duplicate -- stops the sender retrying
-        continue
-    handler.on_message(peer_id, payload[8..])   // deliver app bytes (ID stripped)
-    session.send(b"")                   // empty ACK to the sender (see note below)
+    route_flag = payload[8]            // 0x00 = direct, 0x01 = routed (ADR 019)
+
+    if route_flag == 0x00:             // direct delivery
+        if dedup_cache.check_and_insert(peer_id, message_id):
+            session.send(b"")          // ACK duplicate -- stops sender retrying
+            continue
+        handler.on_message(peer_id, payload[9..])   // deliver app bytes
+    else if route_flag == 0x01:        // routed delivery
+        dest = payload[9..41]          // 32-byte destination PeerId
+        ttl  = payload[41]             // remaining hops
+        data = payload[42..]
+        if dest == local_peer_id:
+            if !dedup_cache.check_routed(message_id):
+                handler.on_message(sender_peer_id, data)
+        else if ttl == 0:
+            // silent drop
+        else if !dedup_cache.check_routed(message_id):
+            // forward to all peers except sender with ttl-1, same message_id
+    session.send(b"")                   // hop-to-hop ACK in all cases
 ```
 
 **Why the ACK is required:** Quinn's `write_all()` writes to an internal send buffer; actual transmission is async. If the sender drops the session immediately after `send()`, Quinn fires `CONNECTION_CLOSE` before flushing the buffer and the data is silently lost. The receiver's empty ACK keeps the sender's connection alive long enough for the data to be transmitted. `send()` returning `Ok(())` is only meaningful when this round-trip completes. See ADR 009 and issue #34.
@@ -614,9 +653,9 @@ with a phone running the native SDK.
 
 Being clear about this matters as much as being clear about what it does.
 
-- No WiFi Direct, SMS, or USSD transports
+- No WiFi Direct, SMS, or USSD transports (planned; WiFi Direct targeted for v0.4.0)
 - No MLS group key exchange (Noise_XX is 1:1 only)
-- No multi-hop BLE routing (single-hop only)
+- No WiFi Direct, acoustic, SMS, or USSD transports
 - No key gossip yet (address exchange type 1 implemented in v0.3.0; key gossip via type 2 follows)
 - No OS network event integration for health monitoring (polling via if-addrs; rtnetlink,
   NWPathMonitor, and WinRT network events deferred to v0.3.0). See ADR 013.
