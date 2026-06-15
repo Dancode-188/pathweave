@@ -31,7 +31,7 @@ struct TransportEntry {
 /// task per transport tracks availability so send() always reflects current state.
 /// Connections are lazy: opened on send(), closed after.
 pub struct Router {
-    transports: std::sync::Mutex<Vec<TransportEntry>>,
+    transports: Arc<Mutex<Vec<TransportEntry>>>,
     event_tx: broadcast::Sender<TransportEvent>,
 }
 
@@ -39,7 +39,7 @@ impl Router {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {
-            transports: std::sync::Mutex::new(Vec::new()),
+            transports: Arc::new(Mutex::new(Vec::new())),
             event_tx,
         }
     }
@@ -69,6 +69,7 @@ impl Router {
             identity,
             self.event_tx.clone(),
             kind,
+            Arc::clone(&self.transports),
         ));
 
         self.transports.lock().unwrap().push(TransportEntry {
@@ -291,13 +292,14 @@ impl Drop for Router {
 ///
 /// Sets available and sends on the started watch channel to signal consumers
 /// (accept_loop, peer_stream) on each transition.
-pub(crate) async fn health_monitor(
+async fn health_monitor(
     transport: Arc<dyn Transport>,
     started: watch::Sender<bool>,
     available: Arc<AtomicBool>,
     identity: Arc<NodeIdentity>,
     event_tx: broadcast::Sender<TransportEvent>,
     kind: TransportKind,
+    transports: Arc<Mutex<Vec<TransportEntry>>>,
 ) {
     let mut prev_addrs = current_ipv4_addrs();
     let mut in_recovery = if transport.start(&identity).await.is_ok() {
@@ -324,8 +326,22 @@ pub(crate) async fn health_monitor(
             continue;
         }
 
+        // Read before flipping: only fire a "switched away from this transport"
+        // event when it was actually available. Recovery retries must not fire
+        // a spurious TransportChanged because the transport was never up.
+        let was_available = available.load(Ordering::Acquire);
         available.store(false, Ordering::Release);
         let _ = started.send(false);
+
+        if was_available {
+            if let Some(next_kind) = next_best_transport(&transports, &available) {
+                let _ = event_tx.send(TransportEvent::TransportChanged {
+                    from: Some(kind),
+                    to: next_kind,
+                });
+            }
+        }
+
         let _ = transport.stop().await;
 
         if transport.start(&identity).await.is_ok() {
@@ -349,6 +365,31 @@ pub(crate) async fn health_monitor(
             in_recovery = true;
         }
     }
+}
+
+/// Returns the kind of the cheapest available transport that is not the one
+/// identified by `own_available`. Used by health_monitor to select a fallback
+/// transport when the transport it manages drops.
+///
+/// Excludes the current transport by pointer identity (Arc::ptr_eq) rather than
+/// by kind, so two transports of the same kind are handled correctly.
+fn next_best_transport(
+    transports: &Arc<Mutex<Vec<TransportEntry>>>,
+    own_available: &Arc<AtomicBool>,
+) -> Option<TransportKind> {
+    transports
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            !Arc::ptr_eq(&e.available, own_available) && e.available.load(Ordering::Acquire)
+        })
+        .min_by_key(|e| match e.transport.cost() {
+            TransportCost::Free => 0u8,
+            TransportCost::Metered => 1u8,
+            TransportCost::Unknown => 2u8,
+        })
+        .map(|e| e.transport.kind())
 }
 
 fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
@@ -1292,6 +1333,7 @@ mod tests {
             Arc::new(NodeIdentity::generate()),
             event_tx,
             TransportKind::Ble,
+            Arc::new(Mutex::new(Vec::new())),
         ));
 
         tokio::task::yield_now().await;
@@ -1320,6 +1362,7 @@ mod tests {
             Arc::new(NodeIdentity::generate()),
             event_tx,
             TransportKind::Ble,
+            Arc::new(Mutex::new(Vec::new())),
         ));
 
         // Yield so the initial start() runs and fails.
@@ -1365,6 +1408,7 @@ mod tests {
             Arc::new(NodeIdentity::generate()),
             event_tx,
             TransportKind::Ble,
+            Arc::new(Mutex::new(Vec::new())),
         ));
 
         tokio::task::yield_now().await;
@@ -1389,6 +1433,63 @@ mod tests {
             "recovered on second retry"
         );
         assert!(*started_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn next_best_transport_selects_cheapest_available_other() {
+        // Build a transports list with three entries:
+        //   [0] current transport (Ble, Free) — the one that just went unavailable
+        //   [1] fallback Quic, Metered, available
+        //   [2] fallback Ble2, Free, available
+        // Expect: Ble2 wins (Free beats Metered).
+        let current_available = Arc::new(AtomicBool::new(false)); // already flipped off
+        let quic_available = Arc::new(AtomicBool::new(true));
+        let ble2_available = Arc::new(AtomicBool::new(true));
+
+        let (t_current, _, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
+        let (t_quic, _, _) = make_transport(TransportCost::Metered, TransportKind::Quic, false);
+        let (t_ble2, _, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
+
+        let dummy_task = tokio::spawn(std::future::pending::<()>());
+        let transports = Arc::new(Mutex::new(vec![
+            TransportEntry {
+                transport: t_current,
+                available: Arc::clone(&current_available),
+                task: tokio::spawn(std::future::pending::<()>()),
+            },
+            TransportEntry {
+                transport: t_quic,
+                available: Arc::clone(&quic_available),
+                task: tokio::spawn(std::future::pending::<()>()),
+            },
+            TransportEntry {
+                transport: t_ble2,
+                available: Arc::clone(&ble2_available),
+                task: dummy_task,
+            },
+        ]));
+
+        let result = next_best_transport(&transports, &current_available);
+        assert_eq!(
+            result,
+            Some(TransportKind::Ble),
+            "Free Ble2 should beat Metered Quic"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_best_transport_returns_none_when_no_fallback() {
+        let current_available = Arc::new(AtomicBool::new(false));
+        let (t_current, _, _) = make_transport(TransportCost::Free, TransportKind::Ble, false);
+
+        let transports = Arc::new(Mutex::new(vec![TransportEntry {
+            transport: t_current,
+            available: Arc::clone(&current_available),
+            task: tokio::spawn(std::future::pending::<()>()),
+        }]));
+
+        let result = next_best_transport(&transports, &current_available);
+        assert_eq!(result, None, "no other transport available");
     }
 
     // --- peer_stream tests ----------------------------------------------------
