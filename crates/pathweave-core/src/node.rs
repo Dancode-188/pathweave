@@ -2326,8 +2326,7 @@ mod tests {
         let post_restart_addr = PeerAddress::Quic("127.0.0.1:5000".parse().unwrap());
 
         let addrs = Arc::new(std::sync::Mutex::new(vec![initial_addr.clone()]));
-        let (conn_tx, conn_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
 
         let transport = RestartableMockTransport {
             conn_rx: tokio::sync::Mutex::new(conn_rx),
