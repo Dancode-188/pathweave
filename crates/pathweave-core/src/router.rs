@@ -479,6 +479,13 @@ pub(crate) fn encode_addr_exchange(addrs: &[PeerAddress]) -> Vec<u8> {
                 buf.push(len);
                 buf.extend_from_slice(&bytes[..len as usize]);
             }
+            PeerAddress::WifiDirect(id) => {
+                let bytes = id.as_bytes();
+                let len = bytes.len().min(255) as u8;
+                buf.push(0x03);
+                buf.push(len);
+                buf.extend_from_slice(&bytes[..len as usize]);
+            }
         }
     }
     buf
@@ -544,6 +551,22 @@ pub(crate) fn decode_addr_exchange(bytes: &[u8]) -> Option<Vec<PeerAddress>> {
                     .to_string();
                 pos += len;
                 addrs.push(PeerAddress::Ble(id));
+            }
+            0x03 => {
+                pos += 1;
+                if pos >= bytes.len() {
+                    return None;
+                }
+                let len = bytes[pos] as usize;
+                pos += 1;
+                if pos + len > bytes.len() {
+                    return None;
+                }
+                let id = std::str::from_utf8(&bytes[pos..pos + len])
+                    .ok()?
+                    .to_string();
+                pos += len;
+                addrs.push(PeerAddress::WifiDirect(id));
             }
             _ => return None,
         }
@@ -853,6 +876,7 @@ mod tests {
             match self.kind {
                 TransportKind::Ble => "mock-ble",
                 TransportKind::Quic => "mock-quic",
+                TransportKind::WifiDirect => "mock-wifi-direct",
             }
         }
     }

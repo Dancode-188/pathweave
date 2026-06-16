@@ -192,6 +192,7 @@ pub struct PeerAnnouncement {
 pub enum PeerAddress {
     Quic(std::net::SocketAddr),
     Ble(String),
+    WifiDirect(String),
 }
 
 impl PeerAddress {
@@ -199,6 +200,7 @@ impl PeerAddress {
         match self {
             PeerAddress::Quic(_) => TransportKind::Quic,
             PeerAddress::Ble(_) => TransportKind::Ble,
+            PeerAddress::WifiDirect(_) => TransportKind::WifiDirect,
         }
     }
 }
@@ -208,6 +210,7 @@ impl std::fmt::Display for PeerAddress {
         match self {
             PeerAddress::Quic(addr) => write!(f, "{}", addr),
             PeerAddress::Ble(id) => write!(f, "{}", id),
+            PeerAddress::WifiDirect(id) => write!(f, "{}", id),
         }
     }
 }
@@ -223,6 +226,7 @@ pub enum TransportCost {
 pub enum TransportKind {
     Quic,
     Ble,
+    WifiDirect,
 }
 
 #[derive(Debug, Clone)]
