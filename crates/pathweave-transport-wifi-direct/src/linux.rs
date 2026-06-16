@@ -12,9 +12,7 @@ use std::sync::Arc;
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use pathweave_core::{
-    NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, Result,
-};
+use pathweave_core::{NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, Result};
 use tokio::net::TcpStream;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection as ZbusConn, Proxy};
@@ -176,8 +174,9 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
                         Value::Str(s) => Some(s.to_string()),
                         _ => None,
                     });
-                    let short_id =
-                        device_name.as_deref().and_then(parse_short_id_from_service_name);
+                    let short_id = device_name
+                        .as_deref()
+                        .and_then(parse_short_id_from_service_name);
 
                     // The peer P2P device address is the last component of the object path.
                     let mac = peer_path.rsplit('/').next().unwrap_or("").to_string();
