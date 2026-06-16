@@ -38,7 +38,6 @@ const WPA_PATH: &str = "/fi/w1/wpa_supplicant1";
 pub(crate) struct LinuxState {
     _conn: ZbusConn,
     iface_path: OwnedObjectPath,
-    conn_tx: tokio::sync::mpsc::UnboundedSender<WifiDirectConnection>,
     local_short_id: [u8; 8],
 }
 
@@ -113,7 +112,6 @@ pub(crate) async fn start(inner: &Arc<Inner>, identity: &NodeIdentity) -> Result
     let state = LinuxState {
         _conn: conn,
         iface_path,
-        conn_tx,
         local_short_id,
     };
 
