@@ -56,14 +56,9 @@ pub(crate) async fn start(inner: &Arc<Inner>, identity: &NodeIdentity) -> Result
         .map_err(|e| PathweaveError::Transport(format!("D-Bus connection failed: {e}")))?;
 
     // Get the first P2P-capable wireless interface from wpa_supplicant.
-    let wpa_proxy = Proxy::new(
-        &conn,
-        WPA_SERVICE,
-        WPA_PATH,
-        "fi.w1.wpa_supplicant1",
-    )
-    .await
-    .map_err(|e| PathweaveError::Transport(format!("wpa_supplicant proxy failed: {e}")))?;
+    let wpa_proxy = Proxy::new(&conn, WPA_SERVICE, WPA_PATH, "fi.w1.wpa_supplicant1")
+        .await
+        .map_err(|e| PathweaveError::Transport(format!("wpa_supplicant proxy failed: {e}")))?;
 
     let iface_paths: Vec<OwnedObjectPath> = wpa_proxy
         .get_property("Interfaces")
@@ -85,10 +80,7 @@ pub(crate) async fn start(inner: &Arc<Inner>, identity: &NodeIdentity) -> Result
         "service_type",
         OwnedValue::try_from(Value::from("bonjour")).unwrap(),
     );
-    svc_args.insert(
-        "version",
-        OwnedValue::try_from(Value::from(1u32)).unwrap(),
-    );
+    svc_args.insert("version", OwnedValue::try_from(Value::from(1u32)).unwrap());
     svc_args.insert(
         "service",
         OwnedValue::try_from(Value::from(P2P_SERVICE_NAME)).unwrap(),
@@ -157,15 +149,14 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
         let iface_path = state.iface_path.clone();
         drop(guard);
 
-        let p2p_proxy = match Proxy::new(&conn, WPA_SERVICE, iface_path.as_str(), WPA_P2P_IFACE)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("WiFi Direct discover: P2PDevice proxy failed: {e}");
-                return;
-            }
-        };
+        let p2p_proxy =
+            match Proxy::new(&conn, WPA_SERVICE, iface_path.as_str(), WPA_P2P_IFACE).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("WiFi Direct discover: P2PDevice proxy failed: {e}");
+                    return;
+                }
+            };
 
         // Subscribe to P2PPeerFound signals.
         let mut stream = match p2p_proxy.receive_signal("P2PPeerFound").await {
@@ -178,7 +169,8 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
 
         while let Some(msg) = stream.next().await {
             // P2PPeerFound body: (object_path: str, properties: dict<str, variant>)
-            let body: zbus::Result<(String, HashMap<String, OwnedValue>)> = msg.body().deserialize();
+            let body: zbus::Result<(String, HashMap<String, OwnedValue>)> =
+                msg.body().deserialize();
             match body {
                 Ok((peer_path, props)) => {
                     // Extract short_id from service data if present.
@@ -215,7 +207,10 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
 // connect (initiator side)
 // --------------------------------------------------------------------------
 
-pub(crate) async fn connect(inner: &Arc<Inner>, peer: &PeerAnnouncement) -> Result<Box<dyn pathweave_core::Connection>> {
+pub(crate) async fn connect(
+    inner: &Arc<Inner>,
+    peer: &PeerAnnouncement,
+) -> Result<Box<dyn pathweave_core::Connection>> {
     let device_id = match &peer.address {
         PeerAddress::WifiDirect(id) => id.clone(),
         _ => {
@@ -279,28 +274,26 @@ pub(crate) async fn connect(inner: &Arc<Inner>, peer: &PeerAnnouncement) -> Resu
         .map_err(|e| PathweaveError::Transport(format!("P2PConnect failed: {e}")))?;
 
     // Wait for GroupStarted with a 30-second timeout.
-    let group_props = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            while let Some(msg) = group_stream.next().await {
-                let body: zbus::Result<(HashMap<String, OwnedValue>,)> =
-                    msg.body().deserialize();
-                if let Ok((props,)) = body {
-                    return Some(props);
-                }
+    let group_props = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(msg) = group_stream.next().await {
+            let body: zbus::Result<(HashMap<String, OwnedValue>,)> = msg.body().deserialize();
+            if let Ok((props,)) = body {
+                return Some(props);
             }
-            None
-        },
-    )
+        }
+        None
+    })
     .await
     .map_err(|_| PathweaveError::Transport("WiFi Direct: P2P group formation timed out".into()))?
     .ok_or_else(|| PathweaveError::Transport("WiFi Direct: GroupStarted stream closed".into()))?;
 
     let peer_ip = extract_go_ip(&group_props, we_are_go)?;
 
-    let addr: SocketAddr = format!("{peer_ip}:{WIFI_DIRECT_PORT}").parse().map_err(|e| {
-        PathweaveError::Transport(format!("WiFi Direct: invalid peer IP '{peer_ip}': {e}"))
-    })?;
+    let addr: SocketAddr = format!("{peer_ip}:{WIFI_DIRECT_PORT}")
+        .parse()
+        .map_err(|e| {
+            PathweaveError::Transport(format!("WiFi Direct: invalid peer IP '{peer_ip}': {e}"))
+        })?;
 
     tracing::debug!("WiFi Direct: connecting TCP to {addr}");
     let stream = TcpStream::connect(addr)
@@ -315,15 +308,10 @@ pub(crate) async fn connect(inner: &Arc<Inner>, peer: &PeerAnnouncement) -> Resu
 // --------------------------------------------------------------------------
 
 pub(crate) async fn accept(inner: &Arc<Inner>) -> Result<Box<dyn pathweave_core::Connection>> {
-    let conn = inner
-        .conn_rx
-        .lock()
-        .await
-        .as_mut()
-        .and_then(|rx| {
-            // Non-blocking: return None if no connection is ready yet.
-            rx.try_recv().ok()
-        });
+    let conn = inner.conn_rx.lock().await.as_mut().and_then(|rx| {
+        // Non-blocking: return None if no connection is ready yet.
+        rx.try_recv().ok()
+    });
 
     if let Some(c) = conn {
         return Ok(Box::new(c));
@@ -332,9 +320,11 @@ pub(crate) async fn accept(inner: &Arc<Inner>) -> Result<Box<dyn pathweave_core:
     // Block until a connection arrives.
     let mut guard = inner.conn_rx.lock().await;
     match guard.as_mut() {
-        Some(rx) => rx.recv().await.map(|c| Box::new(c) as Box<dyn pathweave_core::Connection>).ok_or_else(|| {
-            PathweaveError::Transport("WiFi Direct: accept channel closed".into())
-        }),
+        Some(rx) => rx
+            .recv()
+            .await
+            .map(|c| Box::new(c) as Box<dyn pathweave_core::Connection>)
+            .ok_or_else(|| PathweaveError::Transport("WiFi Direct: accept channel closed".into())),
         None => Err(PathweaveError::Transport(
             "WiFi Direct transport not started".into(),
         )),
@@ -424,10 +414,7 @@ async fn accept_loop(
 
 /// Extracts the peer's IP address from the GroupStarted properties.
 /// When we are GO, the peer is the client; when we are client, the peer is GO.
-fn extract_go_ip(
-    props: &HashMap<String, OwnedValue>,
-    we_are_go: bool,
-) -> Result<String> {
+fn extract_go_ip(props: &HashMap<String, OwnedValue>, we_are_go: bool) -> Result<String> {
     // wpa_supplicant GroupStarted provides "ip_addr_go" (the GO's IP) and
     // "ip_addr" (the local interface IP). If we are client, the peer is GO.
     // If we are GO, the client IP is available via "ip_addr_go" only after

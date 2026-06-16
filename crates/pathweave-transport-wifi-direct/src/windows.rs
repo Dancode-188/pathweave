@@ -15,8 +15,8 @@ use futures::stream::BoxStream;
 use pathweave_core::{NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, Result};
 use tokio::net::TcpStream;
 use windows::Devices::Enumeration::DeviceInformation;
-use windows::Devices::WiFiDirect::{WiFiDirectConnectionListener, WiFiDirectDevice};
 use windows::Devices::WiFiDirect::WiFiDirectAdvertisementPublisher;
+use windows::Devices::WiFiDirect::{WiFiDirectConnectionListener, WiFiDirectDevice};
 
 use super::{Inner, WIFI_DIRECT_PORT};
 use crate::WifiDirectConnection;
@@ -96,9 +96,12 @@ fn publisher_thread(
     };
 
     let tx = conn_tx.clone();
-    let handler_result = listener.ConnectionRequested(
-        &windows::Foundation::TypedEventHandler::new(
-            move |_, args: &Option<windows::Devices::WiFiDirect::WiFiDirectConnectionRequestedEventArgs>| {
+    let handler_result =
+        listener.ConnectionRequested(&windows::Foundation::TypedEventHandler::new(
+            move |_,
+                  args: &Option<
+                windows::Devices::WiFiDirect::WiFiDirectConnectionRequestedEventArgs,
+            >| {
                 if let Some(args) = args {
                     if let Ok(req) = args.GetConnectionRequest() {
                         if let Ok(device_info) = req.DeviceInformation() {
@@ -116,8 +119,7 @@ fn publisher_thread(
                 }
                 Ok(())
             },
-        ),
-    );
+        ));
 
     if let Err(e) = handler_result {
         tracing::warn!("WiFi Direct: ConnectionRequested handler failed: {e}");
@@ -147,17 +149,11 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
 
     tokio::spawn(async move {
         // Read local_short_id to filter out our own device.
-        let local_short_id = inner
-            .state
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.local_short_id);
+        let local_short_id = inner.state.lock().await.as_ref().map(|s| s.local_short_id);
 
         // All device enumeration is synchronous WinRT; run in block_in_place.
-        let announcements: Vec<PeerAnnouncement> = tokio::task::block_in_place(|| {
-            enumerate_peers(local_short_id)
-        });
+        let announcements: Vec<PeerAnnouncement> =
+            tokio::task::block_in_place(|| enumerate_peers(local_short_id));
 
         for ann in announcements {
             if tx.unbounded_send(ann).is_err() {
@@ -178,8 +174,7 @@ fn enumerate_peers(local_short_id: Option<[u8; 8]>) -> Vec<PeerAnnouncement> {
         }
     };
 
-    let devices = match DeviceInformation::FindAllAsyncAqsFilter(&selector)
-        .and_then(|op| op.get())
+    let devices = match DeviceInformation::FindAllAsyncAqsFilter(&selector).and_then(|op| op.get())
     {
         Ok(d) => d,
         Err(e) => {
@@ -294,9 +289,7 @@ pub(crate) async fn connect(
     let addr: SocketAddr = format!("{remote_ip}:{WIFI_DIRECT_PORT}")
         .parse()
         .map_err(|e| {
-            PathweaveError::Transport(format!(
-                "WiFi Direct: invalid remote IP '{remote_ip}': {e}"
-            ))
+            PathweaveError::Transport(format!("WiFi Direct: invalid remote IP '{remote_ip}': {e}"))
         })?;
 
     tracing::debug!("WiFi Direct (Windows): connecting TCP to {addr}");
@@ -318,9 +311,7 @@ pub(crate) async fn accept(inner: &Arc<Inner>) -> Result<Box<dyn pathweave_core:
             .recv()
             .await
             .map(|c| Box::new(c) as Box<dyn pathweave_core::Connection>)
-            .ok_or_else(|| {
-                PathweaveError::Transport("WiFi Direct: accept channel closed".into())
-            }),
+            .ok_or_else(|| PathweaveError::Transport("WiFi Direct: accept channel closed".into())),
         None => Err(PathweaveError::Transport(
             "WiFi Direct transport not started".into(),
         )),
@@ -345,7 +336,9 @@ async fn handle_incoming(
 
         let wifi_device = WiFiDirectDevice::FromIdAsync(&id)
             .and_then(|op| op.get())
-            .map_err(|e| PathweaveError::Transport(format!("FromIdAsync (incoming) failed: {e}")))?;
+            .map_err(|e| {
+                PathweaveError::Transport(format!("FromIdAsync (incoming) failed: {e}"))
+            })?;
 
         let endpoints = wifi_device
             .GetConnectionEndpointPairs()
@@ -365,14 +358,11 @@ async fn handle_incoming(
             .map_err(|e| PathweaveError::Transport(format!("DisplayName failed: {e}")))
     })?;
 
-    let bind_addr: SocketAddr =
-        format!("{local_ip}:{WIFI_DIRECT_PORT}")
-            .parse()
-            .map_err(|e| {
-                PathweaveError::Transport(format!(
-                    "WiFi Direct: invalid local IP '{local_ip}': {e}"
-                ))
-            })?;
+    let bind_addr: SocketAddr = format!("{local_ip}:{WIFI_DIRECT_PORT}")
+        .parse()
+        .map_err(|e| {
+            PathweaveError::Transport(format!("WiFi Direct: invalid local IP '{local_ip}': {e}"))
+        })?;
 
     tracing::debug!("WiFi Direct (Windows): GO listening on {bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr)
