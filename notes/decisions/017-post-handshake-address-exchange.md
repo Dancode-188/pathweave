@@ -64,6 +64,7 @@ for each address:
     0x00 = QUIC over IPv4
     0x01 = QUIC over IPv6
     0x02 = BLE
+    0x03 = WiFi Direct
   for kind 0x00 (QUIC IPv4):
     [ip:   4 bytes, network byte order]
     [port: 2 bytes, big-endian]
@@ -73,11 +74,19 @@ for each address:
   for kind 0x02 (BLE):
     [len: u8]                 byte length of the UTF-8 string
     [id:  len bytes]          BLE peripheral ID string (MAC or UUID)
+  for kind 0x03 (WiFi Direct):
+    [len: u8]                 byte length of the UTF-8 string
+    [id:  len bytes]          platform device identifier (MAC on Linux, WinRT device ID on Windows)
 ```
 
 BLE peripheral ID strings are platform-specific ASCII: 17 bytes on Linux (MAC format
 `AA:BB:CC:DD:EE:FF`), 36 bytes on Windows and macOS (UUID format). Both fit in a `u8`
 length prefix. The receiver stores the string as-is into `PeerAddress::Ble(String)`.
+
+WiFi Direct device identifier strings follow the same encoding. On Linux the identifier
+is a P2P device MAC address (17 bytes); on Windows it is a WinRT device ID string. Both
+fit in a `u8` length prefix. The receiver stores the string as-is into
+`PeerAddress::WifiDirect(String)`. See ADR 022.
 
 The encoding is intentionally simple: no versioning byte, no checksum, no schema. If a
 future format change is needed, a new control message type handles it. Unrecognised

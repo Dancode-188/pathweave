@@ -3,6 +3,7 @@ members = [
     "crates/pathweave-core",
     "crates/pathweave-transport-quic",
     "crates/pathweave-transport-ble",
+    "crates/pathweave-transport-wifi-direct",
     "crates/pathweave-uniffi",
     "examples/pw-chat",
 ]
