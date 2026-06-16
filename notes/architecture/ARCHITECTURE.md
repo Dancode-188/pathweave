@@ -59,8 +59,8 @@ the previous.
 
 ## The public API
 
-The public API has seven surfaces: four exposed through UniFFI to Swift and Kotlin,
-three Rust-only methods that are not part of the FFI boundary.
+The public API has ten surfaces: four exposed through UniFFI to Swift and Kotlin,
+six Rust-only methods that are not part of the FFI boundary.
 
 **UniFFI-facing (four):**
 
@@ -78,7 +78,7 @@ node.on_message(handler); // handler implements MessageHandler (see below)
 let mut events = node.events(); // Stream<Item = TransportEvent>
 ```
 
-**Rust-only (four, not in the UDL):**
+**Rust-only (six, not in the UDL):**
 
 ```rust
 // register a transport before first use
@@ -94,6 +94,14 @@ node.add_peer(peer_id, announcement);
 // send a message via mesh routing to a peer that may not be directly reachable
 // floods to all known neighbors with TTL=7; intermediate nodes relay until dest receives
 node.send_routed(peer_id, payload).await?;
+
+// accept payload now, deliver when the specific peer is next reachable
+// returns immediately; delivery fires MessageDelivered on the event stream
+node.store_forward(peer_id, payload).await;
+
+// accept payload now, flood to the mesh when any neighbor is next reachable
+// returns immediately; no end-to-end confirmation (same guarantee as send_routed)
+node.store_forward_routed(dest_peer_id, payload).await;
 ```
 
 `connect()` tries transports in cost order (Free first). It returns the PeerId learned
@@ -128,6 +136,9 @@ pub enum TransportEvent {
     MessageDelivered {
         peer_id: PeerId,
         transport: TransportKind,
+    },
+    StoreFailed {
+        peer_id: PeerId,  // destination that was never reached before the TTL expired
     },
 }
 
@@ -612,6 +623,30 @@ fail, `send()` returns `PathweaveError::DeliveryFailed`. When no transport can r
 peer at all, `send()` returns `PathweaveError::NoTransportAvailable` immediately. No
 silent queuing.
 
+**Store-and-forward delivery**
+
+`store_forward(peer_id, payload)` and `store_forward_routed(dest_peer_id, payload)` are
+the explicit, caller-opt-in alternative. Both return immediately. The payload is held in
+an in-memory queue until a delivery path is available.
+
+`store_forward` drains when the specific peer next appears: via `PeerConnected`, a
+successful `connect()`, or `add_peer()`. The drain calls `router.send()` with the same
+message ID that was assigned at enqueue time. This is required for dedup correctness: if
+a drain attempt delivers the payload but the ACK is lost, the next attempt carries the
+same ID and the receiver's `DeduplicationCache` suppresses the duplicate. See ADR 021.
+
+`store_forward_routed` drains when any neighbor appears, flooding to the mesh the same
+way `send_routed()` does. It does not wait for the specific destination. Delivery
+confirmation is neighbor-acceptance only, matching `send_routed`.
+
+Entries expire after `NodeConfig::store_ttl` (default: 24 hours). On expiry,
+`TransportEvent::StoreFailed { peer_id }` fires once per expired entry. Expiry is checked
+lazily when the drain runs; if no neighbors ever appear, the drain never runs and
+`StoreFailed` never fires.
+
+Both queues are in-memory. A process restart drops all pending payloads. There is no
+persistence across restarts in this version.
+
 ---
 
 ## Servers
@@ -641,7 +676,7 @@ local networks. BLE discovery is automatic: the transport scans for the Pathweav
 UUID and connects without configuration.
 
 When neither transport can reach the peer: "message failed: no transport available."
-No queuing, no silent retry.
+`send()` does not queue or silently retry. Use `store_forward` if you need hold-and-deliver.
 
 BLE in pw-chat works when at least one peer can advertise. Supported configurations:
 two Linux machines, a Linux or Windows machine and a macOS machine, or any combination

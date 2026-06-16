@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::{
     new_key_registry, new_peer_table, router, BundleLayer, Connection, KeyRegistry, MessageHandler,
@@ -16,6 +16,13 @@ use crate::{
 const MAX_TTL: u8 = 7;
 
 const DEDUP_TTL: Duration = Duration::from_secs(60);
+
+const STORE_TTL_DEFAULT: Duration = Duration::from_secs(86_400); // 24 hours
+
+/// (msg_id, app_payload, queued_at). msg_id is assigned at enqueue and reused on every
+/// drain attempt so the receiver's DeduplicationCache can suppress retried deliveries.
+/// See ADR 021.
+type PendingStore = Arc<Mutex<HashMap<PeerId, VecDeque<(u64, Vec<u8>, Instant)>>>>;
 
 /// Tracks recently seen (PeerId, message_id) pairs to suppress duplicate deliveries.
 ///
@@ -109,20 +116,59 @@ pub struct PathweaveNode {
     handler: Arc<Mutex<Option<Box<dyn MessageHandler>>>>,
     dedup: Arc<Mutex<DeduplicationCache>>,
     key_registry: KeyRegistry,
+    store_ttl: Duration,
+    pending_direct: PendingStore,
+    pending_routed: PendingStore,
 }
 
 impl PathweaveNode {
-    /// Creates a new node. `config` is accepted but unused until transport
-    /// implementations are complete; callers should pass `NodeConfig::default()` for now.
-    pub async fn new(_config: NodeConfig, identity: NodeIdentity) -> Result<Self> {
+    pub async fn new(config: NodeConfig, identity: NodeIdentity) -> Result<Self> {
+        let store_ttl = config.store_ttl.unwrap_or(STORE_TTL_DEFAULT);
+        let router = Arc::new(Router::new());
+        let peers = new_peer_table();
+        let key_registry = new_key_registry();
+        let pending_direct: PendingStore = Arc::new(Mutex::new(HashMap::new()));
+        let pending_routed: PendingStore = Arc::new(Mutex::new(HashMap::new()));
+
+        // Drain queued payloads whenever a PeerConnected event arrives from discovery.
+        // connect() and add_peer() trigger drains directly; this task covers the
+        // peer_stream (automatic discovery) path. Exits when the broadcast channel closes.
+        {
+            let mut event_rx = router.event_tx().subscribe();
+            let pd = Arc::clone(&pending_direct);
+            let pr = Arc::clone(&pending_routed);
+            let p = Arc::clone(&peers);
+            let id = identity.clone();
+            let kr = Arc::clone(&key_registry);
+            let r = Arc::clone(&router);
+            let etx = router.event_tx();
+            tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(TransportEvent::PeerConnected(peer_id)) => {
+                            drain_direct_for_peer(&peer_id, &pd, &p, &id, &kr, &r, store_ttl, &etx)
+                                .await;
+                            drain_routed_all(&pr, &p, &id, &kr, &r, store_ttl, &etx).await;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+        }
+
         Ok(Self {
-            router: Arc::new(Router::new()),
+            router,
             identity,
-            peers: new_peer_table(),
+            peers,
             known_addrs: Arc::new(Mutex::new(HashSet::new())),
             handler: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
-            key_registry: new_key_registry(),
+            key_registry,
+            store_ttl,
+            pending_direct,
+            pending_routed,
         })
     }
 
@@ -186,11 +232,37 @@ impl PathweaveNode {
             .lock()
             .unwrap()
             .insert(announcement.address.clone());
-        let mut peers = self.peers.lock().unwrap();
-        let addrs = peers.entry(peer_id.clone()).or_default();
-        if !addrs.iter().any(|a| a.address == announcement.address) {
-            addrs.push(announcement);
+        {
+            let mut peers = self.peers.lock().unwrap();
+            let addrs = peers.entry(peer_id.clone()).or_default();
+            if !addrs.iter().any(|a| a.address == announcement.address) {
+                addrs.push(announcement);
+            }
         }
+
+        let event_tx = self.router.event_tx();
+        drain_direct_for_peer(
+            &peer_id,
+            &self.pending_direct,
+            &self.peers,
+            &self.identity,
+            &self.key_registry,
+            &self.router,
+            self.store_ttl,
+            &event_tx,
+        )
+        .await;
+        drain_routed_all(
+            &self.pending_routed,
+            &self.peers,
+            &self.identity,
+            &self.key_registry,
+            &self.router,
+            self.store_ttl,
+            &event_tx,
+        )
+        .await;
+
         Ok(peer_id)
     }
 
@@ -203,11 +275,45 @@ impl PathweaveNode {
             .lock()
             .unwrap()
             .insert(announcement.address.clone());
-        let mut peers = self.peers.lock().unwrap();
-        let addrs = peers.entry(peer_id).or_default();
-        if !addrs.iter().any(|a| a.address == announcement.address) {
-            addrs.push(announcement);
+        {
+            let mut peers = self.peers.lock().unwrap();
+            let addrs = peers.entry(peer_id.clone()).or_default();
+            if !addrs.iter().any(|a| a.address == announcement.address) {
+                addrs.push(announcement);
+            }
         }
+
+        let pd = Arc::clone(&self.pending_direct);
+        let pr = Arc::clone(&self.pending_routed);
+        let peers = Arc::clone(&self.peers);
+        let identity = self.identity.clone();
+        let key_registry = Arc::clone(&self.key_registry);
+        let router = Arc::clone(&self.router);
+        let store_ttl = self.store_ttl;
+        let event_tx = self.router.event_tx();
+        tokio::spawn(async move {
+            drain_direct_for_peer(
+                &peer_id,
+                &pd,
+                &peers,
+                &identity,
+                &key_registry,
+                &router,
+                store_ttl,
+                &event_tx,
+            )
+            .await;
+            drain_routed_all(
+                &pr,
+                &peers,
+                &identity,
+                &key_registry,
+                &router,
+                store_ttl,
+                &event_tx,
+            )
+            .await;
+        });
     }
 
     /// Sends `payload` to the peer identified by `peer_id`.
@@ -298,6 +404,111 @@ impl PathweaveNode {
         }
     }
 
+    /// Accepts `payload` for deferred delivery to `peer_id` and returns immediately.
+    ///
+    /// If the peer is already reachable, delivery is attempted right away using the same
+    /// path as `send()`. On success the payload is gone. On failure, or if the peer is
+    /// not yet in the peer table, the payload is queued. It drains when the peer next
+    /// appears via discovery, `connect()`, or `add_peer()`.
+    ///
+    /// Entries that remain undelivered past `NodeConfig::store_ttl` are expired with a
+    /// `TransportEvent::StoreFailed` event. See ADR 021.
+    pub async fn store_forward(&self, peer_id: PeerId, payload: Vec<u8>) {
+        let msg_id = router::new_message_id();
+        let queued_at = Instant::now();
+
+        let announcements = self.peers.lock().unwrap().get(&peer_id).cloned();
+        if let Some(anns) = announcements {
+            if !anns.is_empty() {
+                let mut framed = Vec::with_capacity(1 + payload.len());
+                framed.push(0x00);
+                framed.extend_from_slice(&payload);
+                if self
+                    .router
+                    .send(
+                        &anns,
+                        &self.identity,
+                        framed,
+                        &peer_id,
+                        &self.key_registry,
+                        &self.peers,
+                        Some(msg_id),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        self.pending_direct
+            .lock()
+            .unwrap()
+            .entry(peer_id)
+            .or_default()
+            .push_back((msg_id, payload, queued_at));
+    }
+
+    /// Accepts `payload` for deferred mesh delivery to `dest_peer_id` and returns immediately.
+    ///
+    /// If any neighbor is reachable, the payload is flooded immediately (same as `send_routed`).
+    /// If no neighbors are reachable, the payload is queued and flooded when any neighbor next
+    /// appears. Delivery is confirmed at the neighbor level only; no end-to-end confirmation.
+    ///
+    /// Entries expire the same way as `store_forward`. See ADR 021.
+    pub async fn store_forward_routed(&self, dest_peer_id: PeerId, payload: Vec<u8>) {
+        let msg_id = router::new_message_id();
+        let queued_at = Instant::now();
+
+        let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pid, _)| **pid != *self.identity.peer_id())
+            .map(|(pid, anns)| (pid.clone(), anns.clone()))
+            .collect();
+
+        if !neighbors.is_empty() {
+            let mut frame_body = Vec::with_capacity(1 + 32 + 1 + payload.len());
+            frame_body.push(0x01);
+            frame_body.extend_from_slice(dest_peer_id.as_bytes());
+            frame_body.push(MAX_TTL);
+            frame_body.extend_from_slice(&payload);
+
+            let mut any_ok = false;
+            for (neighbor_id, anns) in &neighbors {
+                if self
+                    .router
+                    .send(
+                        anns,
+                        &self.identity,
+                        frame_body.clone(),
+                        neighbor_id,
+                        &self.key_registry,
+                        &self.peers,
+                        Some(msg_id),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    any_ok = true;
+                }
+            }
+            if any_ok {
+                return;
+            }
+        }
+
+        self.pending_routed
+            .lock()
+            .unwrap()
+            .entry(dest_peer_id)
+            .or_default()
+            .push_back((msg_id, payload, queued_at));
+    }
+
     /// Registers a handler that will be called for each incoming message.
     ///
     /// The accept loop is spawned per transport in register_transport(). Transports
@@ -318,6 +529,165 @@ impl PathweaveNode {
     /// and future E2E hop encryption. See ADR 020.
     pub fn lookup_key(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
         self.key_registry.lock().unwrap().get(peer_id).copied()
+    }
+}
+
+/// Drains the direct pending queue for `peer_id`.
+///
+/// Removes all entries atomically under the lock, sends each live entry, and
+/// re-prepends failures to preserve FIFO order. Expired entries fire StoreFailed.
+/// A concurrent drain finds the queue empty and is a no-op. See ADR 021.
+#[allow(clippy::too_many_arguments)]
+async fn drain_direct_for_peer(
+    peer_id: &PeerId,
+    pending_direct: &PendingStore,
+    peers: &PeerTable,
+    identity: &NodeIdentity,
+    key_registry: &KeyRegistry,
+    router: &Arc<Router>,
+    store_ttl: Duration,
+    event_tx: &broadcast::Sender<TransportEvent>,
+) {
+    let entries: Vec<(u64, Vec<u8>, Instant)> = {
+        let mut store = pending_direct.lock().unwrap();
+        match store.remove(peer_id) {
+            Some(q) => q.into_iter().collect(),
+            None => return,
+        }
+    };
+
+    let now = Instant::now();
+    let announcements = peers
+        .lock()
+        .unwrap()
+        .get(peer_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut failures: VecDeque<(u64, Vec<u8>, Instant)> = VecDeque::new();
+    for (msg_id, app_payload, queued_at) in entries {
+        if now.saturating_duration_since(queued_at) > store_ttl {
+            let _ = event_tx.send(TransportEvent::StoreFailed {
+                peer_id: peer_id.clone(),
+            });
+            continue;
+        }
+        if announcements.is_empty() {
+            failures.push_back((msg_id, app_payload, queued_at));
+            continue;
+        }
+        let mut framed = Vec::with_capacity(1 + app_payload.len());
+        framed.push(0x00);
+        framed.extend_from_slice(&app_payload);
+        match router
+            .send(
+                &announcements,
+                identity,
+                framed,
+                peer_id,
+                key_registry,
+                peers,
+                Some(msg_id),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(_) => failures.push_back((msg_id, app_payload, queued_at)),
+        }
+    }
+
+    if !failures.is_empty() {
+        let mut store = pending_direct.lock().unwrap();
+        let queue = store.entry(peer_id.clone()).or_default();
+        for entry in failures.into_iter().rev() {
+            queue.push_front(entry);
+        }
+    }
+}
+
+/// Drains the routed pending queue for every destination.
+///
+/// Any available neighbor is used as the next hop; routed delivery is confirmed at the
+/// neighbor level only. Failed entries are re-prepended to preserve FIFO order.
+/// Expired entries fire StoreFailed. See ADR 021.
+#[allow(clippy::too_many_arguments)]
+async fn drain_routed_all(
+    pending_routed: &PendingStore,
+    peers: &PeerTable,
+    identity: &NodeIdentity,
+    key_registry: &KeyRegistry,
+    router: &Arc<Router>,
+    store_ttl: Duration,
+    event_tx: &broadcast::Sender<TransportEvent>,
+) {
+    let dest_ids: Vec<PeerId> = pending_routed.lock().unwrap().keys().cloned().collect();
+
+    for dest_peer_id in dest_ids {
+        let entries: Vec<(u64, Vec<u8>, Instant)> = {
+            let mut store = pending_routed.lock().unwrap();
+            match store.remove(&dest_peer_id) {
+                Some(q) => q.into_iter().collect(),
+                None => continue,
+            }
+        };
+
+        let now = Instant::now();
+        let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pid, _)| **pid != *identity.peer_id())
+            .map(|(pid, anns)| (pid.clone(), anns.clone()))
+            .collect();
+
+        let mut failures: VecDeque<(u64, Vec<u8>, Instant)> = VecDeque::new();
+        for (msg_id, app_payload, queued_at) in entries {
+            if now.saturating_duration_since(queued_at) > store_ttl {
+                let _ = event_tx.send(TransportEvent::StoreFailed {
+                    peer_id: dest_peer_id.clone(),
+                });
+                continue;
+            }
+            if neighbors.is_empty() {
+                failures.push_back((msg_id, app_payload, queued_at));
+                continue;
+            }
+            let mut frame_body = Vec::with_capacity(1 + 32 + 1 + app_payload.len());
+            frame_body.push(0x01);
+            frame_body.extend_from_slice(dest_peer_id.as_bytes());
+            frame_body.push(MAX_TTL);
+            frame_body.extend_from_slice(&app_payload);
+
+            let mut any_ok = false;
+            for (neighbor_id, anns) in &neighbors {
+                if router
+                    .send(
+                        anns,
+                        identity,
+                        frame_body.clone(),
+                        neighbor_id,
+                        key_registry,
+                        peers,
+                        Some(msg_id),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    any_ok = true;
+                }
+            }
+            if !any_ok {
+                failures.push_back((msg_id, app_payload, queued_at));
+            }
+        }
+
+        if !failures.is_empty() {
+            let mut store = pending_routed.lock().unwrap();
+            let queue = store.entry(dest_peer_id.clone()).or_default();
+            for entry in failures.into_iter().rev() {
+                queue.push_front(entry);
+            }
+        }
     }
 }
 
@@ -1529,5 +1899,370 @@ mod tests {
             1,
             "invariant 4: routed message delivered exactly once despite two distinct sender paths"
         );
+    }
+
+    // --- store_forward tests -------------------------------------------------
+
+    fn ble_ann(addr: &str) -> PeerAnnouncement {
+        PeerAnnouncement {
+            address: PeerAddress::Ble(addr.into()),
+            short_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_forward_delivers_immediately_when_peer_known() {
+        let (t_sender, t_receiver) = wire_transports(TransportKind::Ble);
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+        let pid_receiver = receiver_id.peer_id().clone();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        struct RecordingHandler {
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+        }
+        impl MessageHandler for RecordingHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+
+        let mut node_sender = PathweaveNode::new(NodeConfig::default(), sender_id)
+            .await
+            .unwrap();
+        node_sender.register_transport(Box::new(t_sender));
+        node_sender.add_peer(pid_receiver.clone(), ble_ann("receiver"));
+
+        let mut node_receiver = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node_receiver.register_transport(Box::new(t_receiver));
+        node_receiver.on_message(Box::new(RecordingHandler {
+            done_tx: Arc::clone(&done_tx),
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // Peer is already in the table, so store_forward delivers immediately.
+        node_sender
+            .store_forward(pid_receiver, b"immediate".to_vec())
+            .await;
+
+        let payload = tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(payload, b"immediate");
+    }
+
+    #[tokio::test]
+    async fn store_forward_queues_and_delivers_on_add_peer() {
+        let (t_sender, t_receiver) = wire_transports(TransportKind::Ble);
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+        let pid_receiver = receiver_id.peer_id().clone();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        struct RecordingHandler {
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+        }
+        impl MessageHandler for RecordingHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+
+        let mut node_sender = PathweaveNode::new(NodeConfig::default(), sender_id)
+            .await
+            .unwrap();
+        node_sender.register_transport(Box::new(t_sender));
+
+        let mut node_receiver = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node_receiver.register_transport(Box::new(t_receiver));
+        node_receiver.on_message(Box::new(RecordingHandler {
+            done_tx: Arc::clone(&done_tx),
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // Peer not yet in the table: queued.
+        node_sender
+            .store_forward(pid_receiver.clone(), b"queued delivery".to_vec())
+            .await;
+
+        // Verify payload sits in the queue.
+        assert!(node_sender
+            .pending_direct
+            .lock()
+            .unwrap()
+            .contains_key(&pid_receiver));
+
+        // add_peer triggers the drain.
+        node_sender.add_peer(pid_receiver.clone(), ble_ann("receiver"));
+
+        let payload = tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out waiting for store_forward delivery")
+            .unwrap();
+        assert_eq!(payload, b"queued delivery");
+    }
+
+    #[tokio::test]
+    async fn store_forward_queues_and_delivers_on_connect() {
+        let (t_sender, t_receiver) = wire_transports(TransportKind::Ble);
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+        let pid_receiver = receiver_id.peer_id().clone();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        struct RecordingHandler {
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+        }
+        impl MessageHandler for RecordingHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+
+        let mut node_sender = PathweaveNode::new(NodeConfig::default(), sender_id)
+            .await
+            .unwrap();
+        node_sender.register_transport(Box::new(t_sender));
+
+        let mut node_receiver = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node_receiver.register_transport(Box::new(t_receiver));
+        node_receiver.on_message(Box::new(RecordingHandler {
+            done_tx: Arc::clone(&done_tx),
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // Peer not yet in the table: queued.
+        node_sender
+            .store_forward(pid_receiver.clone(), b"connect delivery".to_vec())
+            .await;
+
+        // connect() completes the handshake and triggers the drain.
+        node_sender.connect(ble_ann("receiver")).await.unwrap();
+
+        let payload = tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out waiting for store_forward delivery after connect")
+            .unwrap();
+        assert_eq!(payload, b"connect delivery");
+    }
+
+    #[tokio::test]
+    async fn store_forward_fifo_order_preserved() {
+        let (t_sender, t_receiver) = wire_transports(TransportKind::Ble);
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+        let pid_receiver = receiver_id.peer_id().clone();
+
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let received_clone = Arc::clone(&received);
+
+        struct OrderHandler {
+            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        }
+        impl MessageHandler for OrderHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                let mut r = self.received.lock().unwrap();
+                r.push(payload);
+                if r.len() == 3 {
+                    if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+
+        let mut node_sender = PathweaveNode::new(NodeConfig::default(), sender_id)
+            .await
+            .unwrap();
+        node_sender.register_transport(Box::new(t_sender));
+
+        let mut node_receiver = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node_receiver.register_transport(Box::new(t_receiver));
+        node_receiver.on_message(Box::new(OrderHandler {
+            received: Arc::clone(&received_clone),
+            done_tx: Arc::clone(&done_tx),
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        node_sender
+            .store_forward(pid_receiver.clone(), b"first".to_vec())
+            .await;
+        node_sender
+            .store_forward(pid_receiver.clone(), b"second".to_vec())
+            .await;
+        node_sender
+            .store_forward(pid_receiver.clone(), b"third".to_vec())
+            .await;
+
+        node_sender.add_peer(pid_receiver, ble_ann("receiver"));
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out waiting for three deliveries")
+            .unwrap();
+
+        let r = received.lock().unwrap();
+        assert_eq!(
+            *r,
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_forward_fires_store_failed_on_expiry() {
+        let sender_id = NodeIdentity::generate();
+        let unknown_peer = NodeIdentity::generate().peer_id().clone();
+
+        let config = NodeConfig {
+            store_ttl: Some(Duration::from_millis(10)),
+            ..NodeConfig::default()
+        };
+        let mut node = PathweaveNode::new(config, sender_id).await.unwrap();
+
+        // Subscribe before queuing so we don't miss the event.
+        let mut event_rx = node.router.event_tx().subscribe();
+
+        node.store_forward(unknown_peer.clone(), b"will expire".to_vec())
+            .await;
+
+        // Wait past the TTL.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // add_peer triggers the drain; the expired check fires StoreFailed before
+        // attempting delivery, even though an announcement is now in the table.
+        node.add_peer(unknown_peer.clone(), ble_ann("unknown"));
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Ok(ev @ TransportEvent::StoreFailed { .. }) => return ev,
+                    Ok(_) => continue,
+                    Err(_) => panic!("broadcast channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for StoreFailed");
+
+        assert!(
+            matches!(event, TransportEvent::StoreFailed { peer_id } if peer_id == unknown_peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn store_forward_routed_delivers_immediately_when_neighbor_known() {
+        let (t_a, t_b) = wire_transports(TransportKind::Ble);
+
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let id_c = NodeIdentity::generate();
+        let pid_b = id_b.peer_id().clone();
+        let pid_c = id_c.peer_id().clone();
+
+        let mut node_a = PathweaveNode::new(NodeConfig::default(), id_a)
+            .await
+            .unwrap();
+        node_a.register_transport(Box::new(t_a));
+        node_a.add_peer(pid_b.clone(), ble_ann("b"));
+
+        // B accepts the relay frame; no handler needed for this assertion.
+        let mut node_b = PathweaveNode::new(NodeConfig::default(), id_b)
+            .await
+            .unwrap();
+        node_b.register_transport(Box::new(t_b));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // B is a neighbor. store_forward_routed should flood immediately and leave
+        // nothing in the queue.
+        node_a
+            .store_forward_routed(pid_c.clone(), b"routed immediate".to_vec())
+            .await;
+
+        assert!(node_a.pending_routed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_forward_routed_queues_and_delivers_on_peer_added() {
+        let (t_a, t_b) = wire_transports(TransportKind::Ble);
+
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let id_c = NodeIdentity::generate();
+        let pid_b = id_b.peer_id().clone();
+        let pid_c = id_c.peer_id().clone();
+
+        // B just needs to accept the frame; no handler needed for this test.
+        let mut node_a = PathweaveNode::new(NodeConfig::default(), id_a)
+            .await
+            .unwrap();
+        node_a.register_transport(Box::new(t_a));
+
+        let mut node_b = PathweaveNode::new(NodeConfig::default(), id_b)
+            .await
+            .unwrap();
+        node_b.register_transport(Box::new(t_b));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // No neighbors yet: queued.
+        node_a
+            .store_forward_routed(pid_c.clone(), b"routed queued".to_vec())
+            .await;
+
+        assert!(node_a.pending_routed.lock().unwrap().contains_key(&pid_c));
+
+        // Adding B as a neighbor triggers the drain.
+        node_a.add_peer(pid_b, ble_ann("b"));
+
+        // Give the spawned drain task time to run.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Queue must be empty after the drain.
+        assert!(node_a.pending_routed.lock().unwrap().is_empty());
     }
 }
