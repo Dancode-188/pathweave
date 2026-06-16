@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub mod bundle;
 pub use bundle::BundleLayer;
@@ -239,6 +240,11 @@ pub enum TransportEvent {
         peer_id: PeerId,
         transport: TransportKind,
     },
+    /// Fired once per store_forward or store_forward_routed entry that expires before
+    /// the destination is reached. See ADR 021.
+    StoreFailed {
+        peer_id: PeerId,
+    },
 }
 
 pub trait MessageHandler: Send + Sync {
@@ -301,4 +307,7 @@ pub(crate) fn new_peer_table() -> PeerTable {
 #[derive(Default)]
 pub struct NodeConfig {
     pub listen_port: Option<u16>,
+    /// How long to hold a payload in the store-and-forward queue before expiring it.
+    /// `None` uses the 24-hour default. See ADR 021.
+    pub store_ttl: Option<Duration>,
 }
