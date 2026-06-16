@@ -13,7 +13,7 @@ use std::sync::Arc;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use pathweave_core::{
-    NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, Result, TransportKind,
+    NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, Result,
 };
 use tokio::net::TcpStream;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -174,10 +174,12 @@ pub(crate) fn discover(inner: Arc<Inner>) -> BoxStream<'static, PeerAnnouncement
             match body {
                 Ok((peer_path, props)) => {
                     // Extract short_id from service data if present.
-                    let short_id = props
-                        .get("DeviceName")
-                        .and_then(|v| v.downcast_ref::<str>())
-                        .and_then(|s| parse_short_id_from_service_name(s));
+                    let device_name = props.get("DeviceName").and_then(|v| match &**v {
+                        Value::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    });
+                    let short_id =
+                        device_name.as_deref().and_then(parse_short_id_from_service_name);
 
                     // The peer P2P device address is the last component of the object path.
                     let mac = peer_path.rsplit('/').next().unwrap_or("").to_string();
@@ -366,21 +368,24 @@ async fn accept_loop(
         };
 
         // Only act on groups where we are GO.
-        let role = props
+        let role: String = props
             .get("role")
-            .and_then(|v| v.downcast_ref::<str>())
-            .unwrap_or("");
+            .and_then(|v| match &**v {
+                Value::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
         if role != "GO" {
             continue;
         }
 
         // The GO's address on the P2P interface comes from the "go_dev_addr" property
         // or can be derived from the P2P interface address.
-        let p2p_iface_addr = match props
-            .get("interface_address")
-            .and_then(|v| v.downcast_ref::<str>())
-        {
-            Some(addr) => addr.to_string(),
+        let p2p_iface_addr = match props.get("interface_address").and_then(|v| match &**v {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        }) {
+            Some(addr) => addr,
             None => continue,
         };
 
@@ -422,8 +427,10 @@ fn extract_go_ip(props: &HashMap<String, OwnedValue>, we_are_go: bool) -> Result
     let key = if we_are_go { "ip_addr" } else { "ip_addr_go" };
     props
         .get(key)
-        .and_then(|v| v.downcast_ref::<str>())
-        .map(|s| s.to_string())
+        .and_then(|v| match &**v {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        })
         .ok_or_else(|| {
             PathweaveError::Transport(format!(
                 "WiFi Direct: '{key}' missing from GroupStarted properties"
