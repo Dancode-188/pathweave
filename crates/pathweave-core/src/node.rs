@@ -708,7 +708,6 @@ async fn accept_loop(
     local_peer_id: PeerId,
 ) {
     let _ = started.wait_for(|v| *v).await;
-    let local_addrs = Arc::new(transport.local_addresses());
     loop {
         match transport.accept().await {
             Ok(conn) => {
@@ -717,7 +716,6 @@ async fn accept_loop(
                 let dedup = Arc::clone(&dedup);
                 let key_registry = Arc::clone(&key_registry);
                 let peers = Arc::clone(&peers);
-                let local_addrs = Arc::clone(&local_addrs);
                 let router = Arc::clone(&router);
                 let local_peer_id = local_peer_id.clone();
                 tokio::spawn(handle_incoming(
@@ -727,7 +725,6 @@ async fn accept_loop(
                     dedup,
                     key_registry,
                     peers,
-                    local_addrs,
                     router,
                     local_peer_id,
                 ));
@@ -754,7 +751,6 @@ async fn handle_incoming(
     dedup: Arc<Mutex<DeduplicationCache>>,
     key_registry: KeyRegistry,
     peers: PeerTable,
-    local_addrs: Arc<Vec<PeerAddress>>,
     router: Arc<Router>,
     local_peer_id: PeerId,
 ) {
@@ -785,7 +781,7 @@ async fn handle_incoming(
             }
         }
         let _ = session
-            .send(&router::encode_addr_exchange(&local_addrs))
+            .send(&router::encode_addr_exchange(&router.local_addresses()))
             .await;
         match session.recv().await {
             Ok(p) => p,
@@ -1108,6 +1104,62 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "accept-mock"
+        }
+    }
+
+    // --- mock transport whose advertised address can change after accept_loop
+    // has already started, to simulate a transport restart -----------------
+
+    struct RestartableMockTransport {
+        conn_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Box<dyn Connection>>>,
+        addrs: Arc<std::sync::Mutex<Vec<PeerAddress>>>,
+    }
+
+    #[async_trait]
+    impl crate::Transport for RestartableMockTransport {
+        async fn start(&self, _identity: &NodeIdentity) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn discover(&self) -> BoxStream<'static, PeerAnnouncement> {
+            Box::pin(stream::empty())
+        }
+
+        async fn connect(&self, _peer: &PeerAnnouncement) -> Result<Box<dyn Connection>> {
+            Err(PathweaveError::Transport("not used".into()))
+        }
+
+        async fn accept(&self) -> Result<Box<dyn Connection>> {
+            self.conn_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| PathweaveError::Transport("no more connections".into()))
+        }
+
+        fn mtu_hint(&self) -> usize {
+            65535
+        }
+
+        fn cost(&self) -> TransportCost {
+            TransportCost::Free
+        }
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::Quic
+        }
+
+        fn name(&self) -> &'static str {
+            "restartable-mock"
+        }
+
+        fn local_addresses(&self) -> Vec<PeerAddress> {
+            self.addrs.lock().unwrap().clone()
         }
     }
 
@@ -2264,5 +2316,85 @@ mod tests {
 
         // Queue must be empty after the drain.
         assert!(node_a.pending_routed.lock().unwrap().is_empty());
+    }
+
+    // --- address exchange reflects live transport addresses (issue #93) ---------
+
+    #[tokio::test]
+    async fn address_exchange_reflects_post_restart_transport_addresses() {
+        let initial_addr = PeerAddress::Quic("127.0.0.1:4000".parse().unwrap());
+        let post_restart_addr = PeerAddress::Quic("127.0.0.1:5000".parse().unwrap());
+
+        let addrs = Arc::new(std::sync::Mutex::new(vec![initial_addr.clone()]));
+        let (conn_tx, conn_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
+
+        let transport = RestartableMockTransport {
+            conn_rx: tokio::sync::Mutex::new(conn_rx),
+            addrs: Arc::clone(&addrs),
+        };
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(transport));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // First connection: transport advertises the initial address.
+        let (c1, s1) = conn_pair();
+        conn_tx.send(Box::new(s1)).unwrap();
+        let sid1 = sender_id.clone();
+        let addrs1 = tokio::spawn(async move {
+            let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(c1)));
+            let mut session = Session::initiate(&sid1, bundled, None).await.unwrap();
+            session
+                .send(&router::encode_addr_exchange(&[]))
+                .await
+                .unwrap();
+            let frame = session.recv().await.unwrap();
+            router::decode_addr_exchange(&frame).unwrap_or_default()
+        });
+        let addrs1 = tokio::time::timeout(Duration::from_secs(5), addrs1)
+            .await
+            .expect("first connection timed out")
+            .unwrap();
+        assert!(
+            addrs1.contains(&initial_addr),
+            "first addr-exchange must advertise the initial address"
+        );
+
+        // Simulate a transport restart: OS assigns a new port.
+        *addrs.lock().unwrap() = vec![post_restart_addr.clone()];
+
+        // Second connection: must see the live address, not the pre-restart snapshot.
+        let (c2, s2) = conn_pair();
+        conn_tx.send(Box::new(s2)).unwrap();
+        let addrs2 = tokio::spawn(async move {
+            let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(c2)));
+            let mut session = Session::initiate(&sender_id, bundled, None).await.unwrap();
+            session
+                .send(&router::encode_addr_exchange(&[]))
+                .await
+                .unwrap();
+            let frame = session.recv().await.unwrap();
+            router::decode_addr_exchange(&frame).unwrap_or_default()
+        });
+        let addrs2 = tokio::time::timeout(Duration::from_secs(5), addrs2)
+            .await
+            .expect("second connection timed out")
+            .unwrap();
+        assert!(
+            !addrs2.contains(&initial_addr),
+            "second addr-exchange must not return the stale pre-restart address"
+        );
+        assert!(
+            addrs2.contains(&post_restart_addr),
+            "second addr-exchange must reflect the post-restart address"
+        );
     }
 }
