@@ -314,4 +314,8 @@ pub struct NodeConfig {
     /// How long to hold a payload in the store-and-forward queue before expiring it.
     /// `None` uses the 24-hour default. See ADR 021.
     pub store_ttl: Option<Duration>,
+    /// Maximum number of payloads held per destination in the store-and-forward queue.
+    /// When a destination's queue is full, the incoming payload is dropped and
+    /// `TransportEvent::StoreFailed` is fired immediately. `None` means no bound.
+    pub max_queue_depth: Option<usize>,
 }
