@@ -117,6 +117,7 @@ pub struct PathweaveNode {
     dedup: Arc<Mutex<DeduplicationCache>>,
     key_registry: KeyRegistry,
     store_ttl: Duration,
+    max_queue_depth: Option<usize>,
     pending_direct: PendingStore,
     pending_routed: PendingStore,
 }
@@ -124,6 +125,7 @@ pub struct PathweaveNode {
 impl PathweaveNode {
     pub async fn new(config: NodeConfig, identity: NodeIdentity) -> Result<Self> {
         let store_ttl = config.store_ttl.unwrap_or(STORE_TTL_DEFAULT);
+        let max_queue_depth = config.max_queue_depth;
         let router = Arc::new(Router::new());
         let peers = new_peer_table();
         let key_registry = new_key_registry();
@@ -167,6 +169,7 @@ impl PathweaveNode {
             dedup: Arc::new(Mutex::new(DeduplicationCache::new())),
             key_registry,
             store_ttl,
+            max_queue_depth,
             pending_direct,
             pending_routed,
         })
@@ -442,12 +445,18 @@ impl PathweaveNode {
             }
         }
 
-        self.pending_direct
-            .lock()
-            .unwrap()
-            .entry(peer_id)
-            .or_default()
-            .push_back((msg_id, payload, queued_at));
+        let mut queue = self.pending_direct.lock().unwrap();
+        let deque = queue.entry(peer_id.clone()).or_default();
+        if let Some(max) = self.max_queue_depth {
+            if deque.len() >= max {
+                let _ = self
+                    .router
+                    .event_tx()
+                    .send(TransportEvent::StoreFailed { peer_id });
+                return;
+            }
+        }
+        deque.push_back((msg_id, payload, queued_at));
     }
 
     /// Accepts `payload` for deferred mesh delivery to `dest_peer_id` and returns immediately.
@@ -501,12 +510,17 @@ impl PathweaveNode {
             }
         }
 
-        self.pending_routed
-            .lock()
-            .unwrap()
-            .entry(dest_peer_id)
-            .or_default()
-            .push_back((msg_id, payload, queued_at));
+        let mut queue = self.pending_routed.lock().unwrap();
+        let deque = queue.entry(dest_peer_id.clone()).or_default();
+        if let Some(max) = self.max_queue_depth {
+            if deque.len() >= max {
+                let _ = self.router.event_tx().send(TransportEvent::StoreFailed {
+                    peer_id: dest_peer_id,
+                });
+                return;
+            }
+        }
+        deque.push_back((msg_id, payload, queued_at));
     }
 
     /// Registers a handler that will be called for each incoming message.
@@ -2239,6 +2253,115 @@ mod tests {
         assert!(
             matches!(event, TransportEvent::StoreFailed { peer_id } if peer_id == unknown_peer)
         );
+    }
+
+    #[tokio::test]
+    async fn store_forward_queue_depth_bound_drops_overflow_and_delivers_kept_in_fifo_order() {
+        let (t_sender, t_receiver) = wire_transports(TransportKind::Ble);
+
+        let sender_id = NodeIdentity::generate();
+        let receiver_id = NodeIdentity::generate();
+        let pid_receiver = receiver_id.peer_id().clone();
+
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let received_clone = Arc::clone(&received);
+
+        struct OrderHandler {
+            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            done_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+            expected: usize,
+        }
+        impl MessageHandler for OrderHandler {
+            fn on_message(&self, _peer_id: PeerId, payload: Vec<u8>) {
+                let mut v = self.received.lock().unwrap();
+                v.push(payload);
+                if v.len() == self.expected {
+                    if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+
+        let config = NodeConfig {
+            max_queue_depth: Some(2),
+            ..NodeConfig::default()
+        };
+        let mut node_sender = PathweaveNode::new(config, sender_id).await.unwrap();
+        node_sender.register_transport(Box::new(t_sender));
+
+        let mut node_receiver = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node_receiver.register_transport(Box::new(t_receiver));
+        node_receiver.on_message(Box::new(OrderHandler {
+            received: Arc::clone(&received_clone),
+            done_tx: Arc::clone(&done_tx),
+            expected: 2,
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        // Subscribe before enqueuing so the StoreFailed event is not missed.
+        let mut event_rx = node_sender.router.event_tx().subscribe();
+
+        // Enqueue three payloads. The third must be dropped because max_queue_depth = 2.
+        node_sender
+            .store_forward(pid_receiver.clone(), b"first".to_vec())
+            .await;
+        node_sender
+            .store_forward(pid_receiver.clone(), b"second".to_vec())
+            .await;
+        node_sender
+            .store_forward(pid_receiver.clone(), b"third".to_vec())
+            .await;
+
+        // Queue must contain exactly two entries.
+        assert_eq!(
+            node_sender
+                .pending_direct
+                .lock()
+                .unwrap()
+                .get(&pid_receiver)
+                .map(|q| q.len())
+                .unwrap_or(0),
+            2,
+            "queue must be capped at max_queue_depth"
+        );
+
+        // StoreFailed must have been fired for the dropped third payload.
+        let failed_event = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Ok(ev @ TransportEvent::StoreFailed { .. }) => return ev,
+                    Ok(_) => continue,
+                    Err(_) => panic!("broadcast channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for StoreFailed on overflow");
+
+        assert!(
+            matches!(failed_event, TransportEvent::StoreFailed { peer_id } if peer_id == pid_receiver)
+        );
+
+        // Adding the peer triggers the drain; exactly two messages must arrive in order.
+        node_sender.add_peer(pid_receiver, ble_ann("receiver"));
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("timed out waiting for queued messages to be delivered")
+            .unwrap();
+
+        let msgs = received.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], b"first");
+        assert_eq!(msgs[1], b"second");
     }
 
     #[tokio::test]
