@@ -21,6 +21,14 @@ use pathweave_core::{
 use tokio::sync::Mutex;
 use uuid::{uuid, Uuid};
 
+mod advertising;
+#[cfg(target_os = "linux")]
+mod linux_adv;
+#[cfg(target_os = "windows")]
+mod windows_adv;
+
+pub use advertising::BleAdvertisingTransport;
+
 // --------------------------------------------------------------------------
 // Protocol constants (defined in ARCHITECTURE.md)
 // --------------------------------------------------------------------------
@@ -173,7 +181,9 @@ fn uuid_to_guid(uuid: &Uuid) -> windows::core::GUID {
 }
 
 #[cfg(target_os = "windows")]
-fn bytes_to_ibuffer(bytes: &[u8]) -> windows::core::Result<windows::Storage::Streams::IBuffer> {
+pub(crate) fn bytes_to_ibuffer(
+    bytes: &[u8],
+) -> windows::core::Result<windows::Storage::Streams::IBuffer> {
     let writer = windows::Storage::Streams::DataWriter::new()?;
     writer.WriteBytes(bytes)?;
     writer.DetachBuffer()
