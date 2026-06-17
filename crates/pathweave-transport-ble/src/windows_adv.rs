@@ -174,3 +174,106 @@ impl AdvertisingBearer for WindowsAdvertisingBearer {
         Box::pin(rx)
     }
 }
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+    use crate::advertising::AdvertisingBearer;
+    use futures::stream::StreamExt;
+    use windows::Devices::Bluetooth::BluetoothAdapter;
+
+    /// Diagnostic only: prints this machine's adapter capabilities and the publisher's
+    /// actual status after Start(), so a timeout in the loopback test below can be
+    /// attributed to a real hardware/driver limitation instead of guessed at.
+    /// `cargo test -p pathweave-transport-ble -- --ignored diagnose --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn diagnose_adapter_capabilities() {
+        let adapter = BluetoothAdapter::GetDefaultAsync()
+            .expect("GetDefaultAsync call failed")
+            .get()
+            .expect("no default Bluetooth adapter found");
+        println!("IsLowEnergySupported: {:?}", adapter.IsLowEnergySupported());
+        println!(
+            "IsPeripheralRoleSupported: {:?}",
+            adapter.IsPeripheralRoleSupported()
+        );
+        println!(
+            "IsCentralRoleSupported: {:?}",
+            adapter.IsCentralRoleSupported()
+        );
+        println!(
+            "IsExtendedAdvertisingSupported: {:?}",
+            adapter.IsExtendedAdvertisingSupported()
+        );
+
+        let publisher = BluetoothLEAdvertisementPublisher::new().unwrap();
+        let buffer = bytes_to_ibuffer(&[ADV_BEARER_MAGIC, 1, 2, 3]).unwrap();
+        let manufacturer_data =
+            BluetoothLEManufacturerData::Create(MANUFACTURER_COMPANY_ID, &buffer).unwrap();
+        publisher
+            .Advertisement()
+            .unwrap()
+            .ManufacturerData()
+            .unwrap()
+            .Append(&manufacturer_data)
+            .unwrap();
+        publisher.SetUseExtendedAdvertisement(true).unwrap();
+        println!("Status before Start: {:?}", publisher.Status());
+        publisher.Start().expect("Start() failed");
+        for i in 0..5 {
+            std::thread::sleep(Duration::from_millis(300));
+            println!(
+                "Status after Start +{}ms: {:?}",
+                (i + 1) * 300,
+                publisher.Status()
+            );
+        }
+        let _ = publisher.Stop();
+    }
+
+    /// Requires a real, enabled Bluetooth radio on this machine that supports BLE 5.0
+    /// extended advertising. Not run by default;
+    /// `cargo test -p pathweave-transport-ble -- --ignored hardware_loopback`.
+    ///
+    /// If this times out, run `diagnose_adapter_capabilities` first and check
+    /// `IsExtendedAdvertisingSupported`: a `false` there means this adapter cannot run
+    /// this transport at all, and no code change will fix that. This is not a
+    /// hypothetical; it is exactly what happened on the machine this test was written
+    /// on. See the ADR 018 addendum for why extended advertising is a hard requirement,
+    /// not an optimization.
+    ///
+    /// Verifies WindowsAdvertisingBearer against actual radio behavior rather than the
+    /// mock: this bearer's own published advertisement is observed by its own watcher
+    /// on the same adapter. Per issue #98's acceptance criteria.
+    #[tokio::test]
+    #[ignore]
+    async fn hardware_loopback_advertise_and_scan() {
+        let bearer = WindowsAdvertisingBearer::new();
+        let mut scan = bearer.scan();
+
+        // Give the watcher time to start before the first advertisement fires.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let payload = b"pathweave-hw-loopback-test".to_vec();
+        let advertise_task = tokio::spawn({
+            let payload = payload.clone();
+            async move { bearer.advertise(payload).await }
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(10), scan.next())
+            .await
+            .expect(
+                "timed out waiting for the watcher to observe our own advertisement; \
+                 run diagnose_adapter_capabilities and check IsExtendedAdvertisingSupported",
+            )
+            .expect("scan stream ended unexpectedly");
+
+        advertise_task
+            .await
+            .expect("advertise task panicked")
+            .expect("advertise() returned an error");
+
+        assert_eq!(received, payload);
+    }
+}
