@@ -144,3 +144,48 @@ work planned for a later release.
   reliability).
 - The Noise handshake runs over the virtual connection as-is. Broadcast transports do
   not require any Noise layer changes.
+
+## Addendum: legacy BLE advertising cannot carry the 16-byte header (2026-06-17)
+
+The wire encoding for BLE advertising-mode bearer is Manufacturer Specific Data (AD
+type 0xFF), not Service Data: Windows' `BluetoothLEAdvertisementPublisher` explicitly
+forbids apps from publishing Service Data AD structures (16-, 32-, and 128-bit UUID
+variants are all in its system-reserved list) and only permits Manufacturer Specific
+Data or non-standard types. `bluer::adv::Advertisement` exposes the matching
+`manufacturer_data: BTreeMap<u16, Vec<u8>>` field on Linux, so both platforms use the
+same AD type and the same wire format.
+
+Legacy BLE advertising's AD payload budget is 31 bytes total. A Manufacturer Specific
+Data AD structure costs 4 bytes of overhead (1 length byte + 1 AD type byte + 2-byte
+company ID), plus another 3 bytes for the mandatory Flags structure, leaving 24 bytes
+for header and payload combined. This ADR's 16-byte header now fits, with 8 bytes left
+for payload. There is no header size, including the reduced sizes this ADR already
+permits for bandwidth-constrained transports, that leaves room for a Noise-encrypted
+payload once a minimum ChaChaPoly authentication tag (16 bytes, present even for an
+empty plaintext) is accounted for: 8 available bytes is still short of that 16-byte
+floor. This held on both platforms checked: BlueZ's 31-byte legacy AD limit on Linux
+and Windows' identical 31-byte limit for `BluetoothLEAdvertisementPublisher` are the
+same constraint, since both are bound by the same BLE 4.x link-layer spec, not an
+OS-specific choice.
+
+BLE advertising-mode bearer therefore requires BLE 5.0 extended advertising as its
+baseline, not legacy advertising: `secondary_channel` on `bluer::adv::Advertisement`
+(Linux) or `UseExtendedAdvertisement` on `BluetoothLEAdvertisementPublisher` (Windows).
+Extended advertising's data length budget is adapter-dependent but well above legacy's
+31 bytes on any BLE 5.0 controller. This does not change the header format or any other
+part of this ADR's decision; it changes which BLE advertising mode each platform
+implementation must use to fit that header at all.
+
+The company ID used for the Manufacturer Specific Data field is `0xFFFF`, the value
+the Bluetooth SIG reserves specifically for testing and unregistered use, not a real
+registered company identifier. This is the same spirit as the self-assigned 128-bit
+UUIDs already used elsewhere in this codebase: honest about being unregistered,
+appropriate for a project at this stage.
+
+macOS is out of scope for this transport, not pending verification like the existing
+GATT-based BLE transport's macOS gap. `CBPeripheralManager` does not expose custom
+service data to advertisements under any advertising mode; this is an Apple API
+restriction already documented in `pathweave-transport-ble/src/lib.rs` for the GATT
+peripheral's advertisement (`CBAdvertisementDataServiceDataKey` is silently ignored).
+Extended advertising does not change what CoreBluetooth exposes to applications. Same
+permanent status as WiFi Direct on macOS.

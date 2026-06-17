@@ -85,6 +85,7 @@ fn transport_kind_name(kind: TransportKind) -> &'static str {
         TransportKind::Quic => "QUIC",
         TransportKind::Ble => "BLE",
         TransportKind::WifiDirect => "WiFiDirect",
+        TransportKind::BleAdvertising => "BLE-Advertising",
     }
 }
 
