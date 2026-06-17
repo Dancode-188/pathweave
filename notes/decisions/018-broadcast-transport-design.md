@@ -144,3 +144,34 @@ work planned for a later release.
   reliability).
 - The Noise handshake runs over the virtual connection as-is. Broadcast transports do
   not require any Noise layer changes.
+
+## Addendum: legacy BLE advertising cannot carry the 16-byte header (2026-06-17)
+
+Legacy BLE advertising's AD payload budget is 31 bytes total. A custom 128-bit vendor
+service UUID (the kind used everywhere else in this codebase, including
+`PATHWEAVE_SERVICE_UUID`) costs 18 bytes of Service Data AD structure overhead by
+itself (1 length byte + 1 AD type byte + 16 UUID bytes), plus another 3 bytes for the
+mandatory Flags structure. That leaves 10 bytes for header and payload combined, less
+than this ADR's 16-byte header alone. There is no header size, including the reduced
+sizes this ADR already permits for bandwidth-constrained transports, that leaves room
+for a Noise-encrypted payload once a minimum ChaChaPoly authentication tag (16 bytes)
+is accounted for. This held on both platforms checked: BlueZ's 31-byte legacy AD limit
+on Linux and Windows' identical 31-byte limit for `BluetoothLEAdvertisementPublisher`
+are the same constraint, since both are bound by the same BLE 4.x link-layer spec, not
+an OS-specific choice.
+
+BLE advertising-mode bearer therefore requires BLE 5.0 extended advertising as its
+baseline, not legacy advertising: `secondary_channel` on `bluer::adv::Advertisement`
+(Linux) or `UseExtendedAdvertisement` on `BluetoothLEAdvertisementPublisher` (Windows).
+Extended advertising's data length budget is adapter-dependent but well above legacy's
+31 bytes on any BLE 5.0 controller. This does not change the header format or any other
+part of this ADR's decision; it changes which BLE advertising mode each platform
+implementation must use to fit that header at all.
+
+macOS is out of scope for this transport, not pending verification like the existing
+GATT-based BLE transport's macOS gap. `CBPeripheralManager` does not expose custom
+service data to advertisements under any advertising mode; this is an Apple API
+restriction already documented in `pathweave-transport-ble/src/lib.rs` for the GATT
+peripheral's advertisement (`CBAdvertisementDataServiceDataKey` is silently ignored).
+Extended advertising does not change what CoreBluetooth exposes to applications. Same
+permanent status as WiFi Direct on macOS.
