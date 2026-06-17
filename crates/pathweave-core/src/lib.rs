@@ -193,6 +193,10 @@ pub enum PeerAddress {
     Quic(std::net::SocketAddr),
     Ble(String),
     WifiDirect(String),
+    /// Hex-encoded 8-byte short_id of the remote peer. Broadcast transports have no
+    /// connection-layer device identifier; short_id is the only addressing information
+    /// available, since it is what every packet header carries. See ADR 018.
+    BleAdvertising(String),
 }
 
 impl PeerAddress {
@@ -201,6 +205,7 @@ impl PeerAddress {
             PeerAddress::Quic(_) => TransportKind::Quic,
             PeerAddress::Ble(_) => TransportKind::Ble,
             PeerAddress::WifiDirect(_) => TransportKind::WifiDirect,
+            PeerAddress::BleAdvertising(_) => TransportKind::BleAdvertising,
         }
     }
 }
@@ -211,6 +216,7 @@ impl std::fmt::Display for PeerAddress {
             PeerAddress::Quic(addr) => write!(f, "{}", addr),
             PeerAddress::Ble(id) => write!(f, "{}", id),
             PeerAddress::WifiDirect(id) => write!(f, "{}", id),
+            PeerAddress::BleAdvertising(id) => write!(f, "{}", id),
         }
     }
 }
@@ -227,6 +233,7 @@ pub enum TransportKind {
     Quic,
     Ble,
     WifiDirect,
+    BleAdvertising,
 }
 
 #[derive(Debug, Clone)]
