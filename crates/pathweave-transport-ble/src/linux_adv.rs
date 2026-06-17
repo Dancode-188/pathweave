@@ -119,7 +119,9 @@ impl AdvertisingBearer for LinuxAdvertisingBearer {
                 };
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    check_and_forward(&device, &tx).await;
+                    if check_and_forward(&device, &tx).await.is_err() {
+                        return;
+                    }
                     let Ok(mut device_events) = device.events().await else {
                         return;
                     };
