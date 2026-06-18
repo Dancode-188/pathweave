@@ -256,6 +256,14 @@ pub enum TransportEvent {
     StoreFailed {
         peer_id: PeerId,
     },
+    /// Fired whenever a key is learned for the first time (not already in the registry),
+    /// whether via a direct Noise handshake or a received gossip announcement. A
+    /// background task floods this onward per ADR 020; firing this event rather than
+    /// flooding inline keeps the handshake/send path that triggered it non-blocking.
+    KeyLearned {
+        peer_id: PeerId,
+        public_key: [u8; 32],
+    },
 }
 
 pub trait MessageHandler: Send + Sync {

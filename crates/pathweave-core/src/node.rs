@@ -13,7 +13,7 @@ use crate::{
     Result, Router, Session, Transport, TransportEvent,
 };
 
-const MAX_TTL: u8 = 7;
+pub(crate) const MAX_TTL: u8 = 7;
 
 const DEDUP_TTL: Duration = Duration::from_secs(60);
 
@@ -151,6 +151,21 @@ impl PathweaveNode {
                             drain_direct_for_peer(&peer_id, &pd, &p, &id, &kr, &r, store_ttl, &etx)
                                 .await;
                             drain_routed_all(&pr, &p, &id, &kr, &r, store_ttl, &etx).await;
+                        }
+                        Ok(TransportEvent::KeyLearned {
+                            peer_id,
+                            public_key,
+                        }) => {
+                            router::flood_key_announcement(
+                                &r,
+                                &id,
+                                &kr,
+                                &p,
+                                id.peer_id(),
+                                &peer_id,
+                                &public_key,
+                            )
+                            .await;
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -777,10 +792,17 @@ async fn handle_incoming(
         }
     };
     let sender_peer_id = session.peer_id().clone();
-    key_registry
+    let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(sender_peer_id.clone(), *session.remote_static_key());
+        .insert(sender_peer_id.clone(), *session.remote_static_key())
+        .is_none();
+    if is_new_key {
+        let _ = router.event_tx().send(TransportEvent::KeyLearned {
+            peer_id: sender_peer_id.clone(),
+            public_key: *session.remote_static_key(),
+        });
+    }
 
     let first = match session.recv().await {
         Ok(p) => p,
@@ -832,6 +854,52 @@ async fn handle_incoming(
             &key_registry,
         )
         .await;
+    }
+}
+
+/// Spawns a background send of `relay_body` (already framed with its own route_flag
+/// byte) to every known neighbor except `sender_peer_id` (so a relayed frame never
+/// bounces straight back to whoever just sent it) and `local_peer_id`. Shared by both
+/// routed-message (0x01) and key-announcement (0x02) relay in `dispatch_payload`, which
+/// differ only in how `relay_body` is framed before reaching this point.
+#[allow(clippy::too_many_arguments)]
+fn spawn_relay_to_neighbors(
+    relay_body: Vec<u8>,
+    msg_id: u64,
+    sender_peer_id: &PeerId,
+    local_peer_id: &PeerId,
+    peers: &PeerTable,
+    router: &Arc<Router>,
+    identity: &NodeIdentity,
+    key_registry: &KeyRegistry,
+) {
+    let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(pid, _)| **pid != *sender_peer_id && **pid != *local_peer_id)
+        .map(|(pid, anns)| (pid.clone(), anns.clone()))
+        .collect();
+
+    for (next_peer_id, announcements) in neighbors {
+        let router = Arc::clone(router);
+        let identity = identity.clone();
+        let relay_body = relay_body.clone();
+        let key_registry = Arc::clone(key_registry);
+        let peers = Arc::clone(peers);
+        tokio::spawn(async move {
+            let _ = router
+                .send(
+                    &announcements,
+                    &identity,
+                    relay_body,
+                    &next_peer_id,
+                    &key_registry,
+                    &peers,
+                    Some(msg_id),
+                )
+                .await;
+        });
     }
 }
 
@@ -906,39 +974,65 @@ async fn dispatch_payload(
                     relay_body.push(new_ttl);
                     relay_body.extend_from_slice(&app_payload);
 
-                    let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(pid, _)| **pid != *sender_peer_id && **pid != *local_peer_id)
-                        .map(|(pid, anns)| (pid.clone(), anns.clone()))
-                        .collect();
-
-                    for (next_peer_id, announcements) in neighbors {
-                        let router = Arc::clone(router);
-                        let identity = identity.clone();
-                        let relay_body = relay_body.clone();
-                        let key_registry = Arc::clone(key_registry);
-                        let peers = Arc::clone(peers);
-                        tokio::spawn(async move {
-                            let _ = router
-                                .send(
-                                    &announcements,
-                                    &identity,
-                                    relay_body,
-                                    &next_peer_id,
-                                    &key_registry,
-                                    &peers,
-                                    Some(msg_id),
-                                )
-                                .await;
-                        });
-                    }
+                    spawn_relay_to_neighbors(
+                        relay_body,
+                        msg_id,
+                        sender_peer_id,
+                        local_peer_id,
+                        peers,
+                        router,
+                        identity,
+                        key_registry,
+                    );
                 } else {
                     tracing::debug!(msg_id, "suppressed duplicate routed message at relay");
                 }
             }
         }
+        0x02 => match router::decode_key_announcement(&payload[9..]) {
+            Some((announced_peer_id, public_key, ttl)) => {
+                if !router::validate_key_announcement(&announced_peer_id, &public_key) {
+                    tracing::debug!(
+                        peer = %sender_peer_id,
+                        "key announcement failed hash validation; dropping"
+                    );
+                } else {
+                    let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                    if is_dup {
+                        tracing::debug!(msg_id, "suppressed duplicate key announcement");
+                    } else {
+                        key_registry
+                            .lock()
+                            .unwrap()
+                            .insert(announced_peer_id.clone(), public_key);
+
+                        let ttl = ttl.min(MAX_TTL);
+                        if ttl > 0 {
+                            let new_ttl = ttl - 1;
+                            let relay_body = router::encode_key_announcement(
+                                &announced_peer_id,
+                                &public_key,
+                                new_ttl,
+                            );
+
+                            spawn_relay_to_neighbors(
+                                relay_body,
+                                msg_id,
+                                sender_peer_id,
+                                local_peer_id,
+                                peers,
+                                router,
+                                identity,
+                                key_registry,
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                tracing::debug!(peer = %sender_peer_id, "key announcement: parse failed; skipping");
+            }
+        },
         _ => {
             tracing::debug!(peer = %sender_peer_id, route_flag, "unknown route_flag; skipping");
         }
@@ -1753,6 +1847,134 @@ mod tests {
             count_a.load(Ordering::Relaxed),
             0,
             "invariant 5: originator does not receive its own message"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_announcement_propagates_to_indirect_peer() {
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let id_c = NodeIdentity::generate();
+
+        let pid_a = id_a.peer_id().clone();
+        let key_a: [u8; 32] = id_a.public_key().try_into().unwrap();
+
+        // B is the active connector on both legs, so connection order is deterministic:
+        // B connects to C first, then to A. When B learns A's key (new), C is already
+        // a known neighbor, so B floods A's key to C. See ADR 020.
+        let (t_b_for_bc, t_c) = wire_transports(TransportKind::Quic);
+        let (t_b_for_ab, t_a) = wire_transports(TransportKind::Ble);
+
+        let mut node_a = PathweaveNode::new(NodeConfig::default(), id_a)
+            .await
+            .unwrap();
+        node_a.register_transport(Box::new(t_a));
+
+        let mut node_b = PathweaveNode::new(NodeConfig::default(), id_b)
+            .await
+            .unwrap();
+        node_b.register_transport(Box::new(t_b_for_bc));
+        node_b.register_transport(Box::new(t_b_for_ab));
+
+        let mut node_c = PathweaveNode::new(NodeConfig::default(), id_c)
+            .await
+            .unwrap();
+        node_c.register_transport(Box::new(t_c));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        node_b
+            .connect(PeerAnnouncement {
+                address: PeerAddress::Quic("127.0.0.1:1".parse().unwrap()),
+                short_id: None,
+            })
+            .await
+            .unwrap();
+
+        node_b
+            .connect(PeerAnnouncement {
+                address: PeerAddress::Ble("a".into()),
+                short_id: None,
+            })
+            .await
+            .unwrap();
+
+        // The flood is fired as a TransportEvent and handled by a background task
+        // (not awaited synchronously by connect()), so poll rather than assert
+        // immediately.
+        let stored = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(key) = node_c.key_registry.lock().unwrap().get(&pid_a).copied() {
+                    return key;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for C to learn A's key via gossip");
+        assert_eq!(
+            stored, key_a,
+            "C must learn A's key via gossip without ever connecting to A directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_key_announcement_is_rejected() {
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn Connection>>();
+        let transport = AcceptMockTransport {
+            conn_rx: tokio::sync::Mutex::new(conn_rx),
+        };
+
+        let receiver_id = NodeIdentity::generate();
+        let sender_id = NodeIdentity::generate();
+
+        let victim_identity = NodeIdentity::generate();
+        let victim_peer_id = victim_identity.peer_id().clone();
+        let attacker_identity = NodeIdentity::generate();
+        let attacker_public_key: [u8; 32] = attacker_identity.public_key().try_into().unwrap();
+
+        let mut node = PathweaveNode::new(NodeConfig::default(), receiver_id)
+            .await
+            .unwrap();
+        node.register_transport(Box::new(transport));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let (client_conn, server_conn) = conn_pair();
+        conn_tx
+            .send(Box::new(server_conn))
+            .expect("transport still alive");
+
+        let victim_peer_id_for_frame = victim_peer_id.clone();
+        tokio::spawn(async move {
+            let bundled: Box<dyn Connection> = Box::new(BundleLayer::new(Box::new(client_conn)));
+            let mut session = Session::initiate(&sender_id, bundled, None).await.unwrap();
+            let msg_id: u64 = 0xDEAD_BEEF_0001_0002;
+            let mut framed = Vec::with_capacity(9 + 32 + 32 + 1);
+            framed.extend_from_slice(&msg_id.to_be_bytes());
+            framed.push(0x02); // key announcement
+            framed.extend_from_slice(victim_peer_id_for_frame.as_bytes());
+            framed.extend_from_slice(&attacker_public_key); // mismatched: forged
+            framed.push(7);
+            session.send(&framed).await.unwrap();
+            // Wait for the ACK so dispatch_payload has time to process before this exits.
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), session.recv()).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let stored = node
+            .key_registry
+            .lock()
+            .unwrap()
+            .get(&victim_peer_id)
+            .copied();
+        assert!(
+            stored.is_none(),
+            "forged key announcement must not be stored in the registry"
         );
     }
 

@@ -9,8 +9,9 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    BundleLayer, KeyRegistry, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId,
-    PeerTable, Result, Session, Transport, TransportCost, TransportEvent, TransportKind,
+    node::MAX_TTL, peer_id_from_public_key, BundleLayer, KeyRegistry, NodeIdentity, PathweaveError,
+    PeerAddress, PeerAnnouncement, PeerId, PeerTable, Result, Session, Transport, TransportCost,
+    TransportEvent, TransportKind,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
@@ -164,11 +165,17 @@ impl Router {
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(learned_key) => {
                         let _ = self.event_tx.send(TransportEvent::MessageDelivered {
                             peer_id: peer_id.clone(),
                             transport: transport.kind(),
                         });
+                        if let Some(public_key) = learned_key {
+                            let _ = self.event_tx.send(TransportEvent::KeyLearned {
+                                peer_id: peer_id.clone(),
+                                public_key,
+                            });
+                        }
                         return Ok(());
                     }
                     Err(e) => tracing::debug!(
@@ -226,9 +233,15 @@ impl Router {
         });
 
         for (transport, ann) in candidates {
-            if let Ok(peer_id) =
+            if let Ok((peer_id, learned_key)) =
                 try_connect(transport.as_ref(), &ann, identity, key_registry, peer_table).await
             {
+                if let Some(public_key) = learned_key {
+                    let _ = self.event_tx.send(TransportEvent::KeyLearned {
+                        peer_id: peer_id.clone(),
+                        public_key,
+                    });
+                }
                 return Ok(peer_id);
             }
         }
@@ -404,7 +417,9 @@ fn current_ipv4_addrs() -> HashSet<Ipv4Addr> {
         .collect()
 }
 
-/// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId.
+/// Dials the transport, completes the Noise_XX handshake, and returns the remote PeerId,
+/// plus the learned key if this was newly learned (not already in the registry before
+/// this call), so the caller can fire a TransportEvent::KeyLearned (ADR 020).
 /// Always uses Noise_XX because the target identity is unknown before dialing.
 /// Performs an address exchange after the handshake (ADR 017), then closes the session.
 /// The close is explicit so transports that require active teardown release resources.
@@ -414,15 +429,17 @@ async fn try_connect(
     identity: &NodeIdentity,
     key_registry: &KeyRegistry,
     peers: &PeerTable,
-) -> Result<PeerId> {
+) -> Result<(PeerId, Option<[u8; 32]>)> {
     let raw = transport.connect(peer).await?;
     let bundled = Box::new(BundleLayer::new(raw));
     let mut session = Session::initiate(identity, bundled, None).await?;
     let peer_id = session.peer_id().clone();
-    key_registry
+    let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(peer_id.clone(), *session.remote_static_key());
+        .insert(peer_id.clone(), *session.remote_static_key())
+        .is_none();
+    let learned_key = is_new_key.then(|| *session.remote_static_key());
     let local = transport.local_addresses();
     let _ = session.send(&encode_addr_exchange(&local)).await;
     match tokio::time::timeout(ADDR_EXCHANGE_TIMEOUT, session.recv()).await {
@@ -434,7 +451,7 @@ async fn try_connect(
         Err(_) => tracing::debug!(peer = %peer_id, "addr-exchange: timed out"),
     }
     let _ = session.close().await;
-    Ok(peer_id)
+    Ok((peer_id, learned_key))
 }
 
 /// Generates a cryptographically random 64-bit message ID from OS entropy.
@@ -612,12 +629,99 @@ pub(crate) fn upsert_peer_addresses(peers: &PeerTable, peer_id: &PeerId, addrs: 
     }
 }
 
+/// Encodes a route_flag 0x02 key announcement body (ADR 020): the route_flag byte
+/// itself, the identity an announcement is about, that identity's static public key,
+/// and a TTL. Callers pass the result to `Router::send` as `payload`;
+/// `Router::send`/`try_send` prepend the 8-byte message ID on top.
+pub(crate) fn encode_key_announcement(peer_id: &PeerId, public_key: &[u8; 32], ttl: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32 + 32 + 1);
+    buf.push(0x02);
+    buf.extend_from_slice(peer_id.as_bytes());
+    buf.extend_from_slice(public_key);
+    buf.push(ttl);
+    buf
+}
+
+/// Decodes a route_flag 0x02 key announcement body. `payload` excludes the 8-byte
+/// message ID and the route_flag byte (the caller has already matched on it).
+/// Returns `None` on malformed length. Does not validate the peer_id/public_key
+/// binding; callers must call `validate_key_announcement` before trusting the result.
+pub(crate) fn decode_key_announcement(payload: &[u8]) -> Option<(PeerId, [u8; 32], u8)> {
+    if payload.len() != 32 + 32 + 1 {
+        return None;
+    }
+    let peer_id_bytes: [u8; 32] = payload[0..32].try_into().ok()?;
+    let public_key: [u8; 32] = payload[32..64].try_into().ok()?;
+    let ttl = payload[64];
+    Some((PeerId::from_bytes(peer_id_bytes), public_key, ttl))
+}
+
+/// Verifies the self-certifying PeerId/public-key binding per ADR 020:
+/// `PeerId = base58(blake3(public_key))`. Mandatory before storing or re-flooding any
+/// received key announcement; a mismatch means the pair was forged or corrupted.
+pub(crate) fn validate_key_announcement(peer_id: &PeerId, public_key: &[u8; 32]) -> bool {
+    peer_id_from_public_key(public_key) == *peer_id
+}
+
+/// Floods a fresh key announcement for `learned_peer_id`/`learned_key` to every known
+/// neighbor except that peer and `local_peer_id`. Called whenever a node directly
+/// learns a key it did not already have via a Noise handshake (not on every handshake,
+/// only the first time, so already-known keys are not re-announced); see ADR 020.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn flood_key_announcement(
+    router: &Router,
+    identity: &NodeIdentity,
+    key_registry: &KeyRegistry,
+    peers: &PeerTable,
+    local_peer_id: &PeerId,
+    learned_peer_id: &PeerId,
+    learned_key: &[u8; 32],
+) {
+    let msg_id = new_message_id();
+    let body = encode_key_announcement(learned_peer_id, learned_key, MAX_TTL);
+
+    let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(pid, _)| *pid != learned_peer_id && *pid != local_peer_id)
+        .map(|(pid, anns)| (pid.clone(), anns.clone()))
+        .collect();
+
+    // Concurrent, not sequential: this runs from a background task (triggered by
+    // TransportEvent::KeyLearned, not awaited from the handshake/send path that
+    // learned the key), so there's no caller-facing latency to protect here, but a
+    // mesh with many neighbors still shouldn't wait on each one in series.
+    let sends = neighbors.into_iter().map(|(next_peer_id, announcements)| {
+        let body = body.clone();
+        async move {
+            let _ = router
+                .send(
+                    &announcements,
+                    identity,
+                    body,
+                    &next_peer_id,
+                    key_registry,
+                    peers,
+                    Some(msg_id),
+                )
+                .await;
+        }
+    });
+    futures::future::join_all(sends).await;
+}
+
 /// Opens a connection through the given transport, wraps it in BundleLayer and
 /// Session, performs an address exchange (ADR 017), prepends the 8-byte message
 /// ID for receiver-side deduplication, sends the framed payload, and waits for
 /// the receiver's delivery ACK. Uses Noise_XK when the key registry has an entry
 /// for peer_id; falls back to Noise_XX on XK failure and evicts the stale entry.
 #[allow(clippy::too_many_arguments)]
+/// Returns the learned key if this call newly populated the registry for `peer_id`
+/// (not already present beforehand), so the caller can fire a TransportEvent::KeyLearned
+/// (ADR 020). Derived directly from this call's own insert, not a snapshot taken before
+/// this function ran: an XK failure can evict and then this same call can repopulate the
+/// entry via an XX fallback, which a before/after snapshot at the caller would miss.
 async fn try_send(
     transport: &dyn Transport,
     peer: &PeerAnnouncement,
@@ -627,7 +731,7 @@ async fn try_send(
     key_registry: &KeyRegistry,
     peer_id: &PeerId,
     peers: &PeerTable,
-) -> Result<()> {
+) -> Result<Option<[u8; 32]>> {
     let remote_key = key_registry.lock().unwrap().get(peer_id).copied();
     let raw = transport.connect(peer).await.map_err(|e| {
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
@@ -645,10 +749,12 @@ async fn try_send(
             return Err(e);
         }
     };
-    key_registry
+    let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(session.peer_id().clone(), *session.remote_static_key());
+        .insert(session.peer_id().clone(), *session.remote_static_key())
+        .is_none();
+    let learned_key = is_new_key.then(|| *session.remote_static_key());
 
     let local = transport.local_addresses();
     let _ = session.send(&encode_addr_exchange(&local)).await;
@@ -673,7 +779,7 @@ async fn try_send(
     // connection handle drops, which happens before the buffer is flushed. Waiting
     // for the receiver's ACK keeps the connection alive until the data is delivered.
     match tokio::time::timeout(Duration::from_secs(5), session.recv()).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => Ok(learned_key),
         Ok(Err(e)) => {
             tracing::debug!(addr = ?peer.address, error = %e, "try_send: ACK recv failed");
             Err(e)
@@ -736,11 +842,11 @@ pub(crate) async fn peer_stream(
                     )
                     .await
                     {
-                        Ok(peer_id) if peer_id == local_peer_id => {
+                        Ok((peer_id, _)) if peer_id == local_peer_id => {
                             // Self-discovery: keep addr in known_addrs so we don't retry.
                             tracing::debug!(addr = %addr, "discovered self; skipping");
                         }
-                        Ok(peer_id) => {
+                        Ok((peer_id, learned_key)) => {
                             tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
                             peers
                                 .lock()
@@ -748,6 +854,12 @@ pub(crate) async fn peer_stream(
                                 .entry(peer_id.clone())
                                 .or_default()
                                 .push(announcement);
+                            if let Some(public_key) = learned_key {
+                                let _ = event_tx.send(TransportEvent::KeyLearned {
+                                    peer_id: peer_id.clone(),
+                                    public_key,
+                                });
+                            }
                             let _ = event_tx.send(TransportEvent::PeerConnected(peer_id));
                         }
                         Err(e) => {
@@ -790,6 +902,53 @@ mod tests {
     use bytes::Bytes;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+    // --- key announcement codec and validation (ADR 020) -----------------------
+
+    #[test]
+    fn key_announcement_roundtrips() {
+        let identity = NodeIdentity::generate();
+        let peer_id = identity.peer_id().clone();
+        let public_key: [u8; 32] = identity.public_key().try_into().unwrap();
+
+        let encoded = encode_key_announcement(&peer_id, &public_key, 7);
+        // encode_key_announcement includes the route_flag byte; decode_key_announcement
+        // expects the caller to have already matched on and stripped it.
+        let decoded = decode_key_announcement(&encoded[1..]).unwrap();
+
+        assert_eq!(decoded.0, peer_id);
+        assert_eq!(decoded.1, public_key);
+        assert_eq!(decoded.2, 7);
+    }
+
+    #[test]
+    fn key_announcement_decode_rejects_wrong_length() {
+        assert!(decode_key_announcement(&[0u8; 64]).is_none());
+        assert!(decode_key_announcement(&[0u8; 66]).is_none());
+    }
+
+    #[test]
+    fn key_announcement_validates_genuine_pair() {
+        let identity = NodeIdentity::generate();
+        let peer_id = identity.peer_id().clone();
+        let public_key: [u8; 32] = identity.public_key().try_into().unwrap();
+        assert!(validate_key_announcement(&peer_id, &public_key));
+    }
+
+    #[test]
+    fn key_announcement_rejects_forged_pair() {
+        let real_identity = NodeIdentity::generate();
+        let real_peer_id = real_identity.peer_id().clone();
+        let attacker_identity = NodeIdentity::generate();
+        let attacker_public_key: [u8; 32] = attacker_identity.public_key().try_into().unwrap();
+
+        // Claiming the attacker's key belongs to the real identity's PeerId must fail:
+        // blake3(attacker_public_key) != real_peer_id.
+        assert!(!validate_key_announcement(
+            &real_peer_id,
+            &attacker_public_key
+        ));
+    }
 
     // --- in-memory connection --------------------------------------------------
 
