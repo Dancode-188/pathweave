@@ -437,8 +437,7 @@ async fn try_connect(
     let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(peer_id.clone(), *session.remote_static_key())
-        .is_none();
+        .insert_direct(peer_id.clone(), *session.remote_static_key());
     let learned_key = is_new_key.then(|| *session.remote_static_key());
     let local = transport.local_addresses();
     let _ = session.send(&encode_addr_exchange(&local)).await;
@@ -732,7 +731,7 @@ async fn try_send(
     peer_id: &PeerId,
     peers: &PeerTable,
 ) -> Result<Option<[u8; 32]>> {
-    let remote_key = key_registry.lock().unwrap().get(peer_id).copied();
+    let remote_key = key_registry.lock().unwrap().get(peer_id);
     let raw = transport.connect(peer).await.map_err(|e| {
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
         e
@@ -752,8 +751,7 @@ async fn try_send(
     let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(session.peer_id().clone(), *session.remote_static_key())
-        .is_none();
+        .insert_direct(session.peer_id().clone(), *session.remote_static_key());
     let learned_key = is_new_key.then(|| *session.remote_static_key());
 
     let local = transport.local_addresses();

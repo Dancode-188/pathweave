@@ -8,9 +8,9 @@ use futures::stream::BoxStream;
 use tokio::sync::{broadcast, watch};
 
 use crate::{
-    new_key_registry, new_peer_table, router, BundleLayer, Connection, KeyRegistry, MessageHandler,
-    NodeConfig, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement, PeerId, PeerTable,
-    Result, Router, Session, Transport, TransportEvent,
+    new_key_registry_with_bound, new_peer_table, router, BundleLayer, Connection, KeyRegistry,
+    MessageHandler, NodeConfig, NodeIdentity, PathweaveError, PeerAddress, PeerAnnouncement,
+    PeerId, PeerTable, Result, Router, Session, Transport, TransportEvent,
 };
 
 pub(crate) const MAX_TTL: u8 = 7;
@@ -128,7 +128,7 @@ impl PathweaveNode {
         let max_queue_depth = config.max_queue_depth;
         let router = Arc::new(Router::new());
         let peers = new_peer_table();
-        let key_registry = new_key_registry();
+        let key_registry = new_key_registry_with_bound(config.max_key_registry_size);
         let pending_direct: PendingStore = Arc::new(Mutex::new(HashMap::new()));
         let pending_routed: PendingStore = Arc::new(Mutex::new(HashMap::new()));
 
@@ -557,7 +557,7 @@ impl PathweaveNode {
     /// Populated after every successful handshake. Used by the Noise_XK upgrade path
     /// and future E2E hop encryption. See ADR 020.
     pub fn lookup_key(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
-        self.key_registry.lock().unwrap().get(peer_id).copied()
+        self.key_registry.lock().unwrap().get(peer_id)
     }
 }
 
@@ -795,8 +795,7 @@ async fn handle_incoming(
     let is_new_key = key_registry
         .lock()
         .unwrap()
-        .insert(sender_peer_id.clone(), *session.remote_static_key())
-        .is_none();
+        .insert_direct(sender_peer_id.clone(), *session.remote_static_key());
     if is_new_key {
         let _ = router.event_tx().send(TransportEvent::KeyLearned {
             peer_id: sender_peer_id.clone(),
@@ -1004,7 +1003,7 @@ async fn dispatch_payload(
                         key_registry
                             .lock()
                             .unwrap()
-                            .insert(announced_peer_id.clone(), public_key);
+                            .insert_gossip(announced_peer_id.clone(), public_key);
 
                         let ttl = ttl.min(MAX_TTL);
                         if ttl > 0 {
@@ -1481,7 +1480,7 @@ mod tests {
         let stored = registry
             .get(&peer_id)
             .expect("key must be in registry after connect");
-        assert_eq!(stored, &expected_key);
+        assert_eq!(stored, expected_key);
     }
 
     #[tokio::test]
@@ -1906,7 +1905,7 @@ mod tests {
         // immediately.
         let stored = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
-                if let Some(key) = node_c.key_registry.lock().unwrap().get(&pid_a).copied() {
+                if let Some(key) = node_c.key_registry.lock().unwrap().get(&pid_a) {
                     return key;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
@@ -1966,12 +1965,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        let stored = node
-            .key_registry
-            .lock()
-            .unwrap()
-            .get(&victim_peer_id)
-            .copied();
+        let stored = node.key_registry.lock().unwrap().get(&victim_peer_id);
         assert!(
             stored.is_none(),
             "forged key announcement must not be stored in the registry"
