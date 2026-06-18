@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::{
     peer_id_from_public_key, Connection, NodeIdentity, PathweaveError, PeerId, Result,
-    NOISE_PARAMS, NOISE_XK_PARAMS,
+    NOISE_K_PARAMS, NOISE_PARAMS, NOISE_XK_PARAMS,
 };
 
 // Maximum Noise protocol message size (spec limit).
@@ -197,6 +197,70 @@ impl Session {
     }
 }
 
+/// Seals `payload` to `dest_public_key` using a one-shot Noise_K message (ADR 023).
+///
+/// Noise_K's pre-message tokens require both parties' static keys before the single
+/// message is written; `identity` proves the sender, `dest_public_key` is the
+/// destination's key from the key registry. The resulting bytes are the complete
+/// sealed message (ephemeral public key, ciphertext, and AEAD tag); the handshake
+/// state is discarded immediately after, there is no transport phase to convert into.
+pub(crate) fn seal(
+    identity: &NodeIdentity,
+    dest_public_key: &[u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mut state = snow::Builder::new(
+        NOISE_K_PARAMS
+            .parse()
+            .expect("hardcoded noise params are valid"),
+    )
+    .local_private_key(identity.private_key_bytes())
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+    .remote_public_key(dest_public_key)
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+    .build_initiator()
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+
+    let mut buf = vec![0u8; NOISE_MSG_MAX];
+    let n = state
+        .write_message(payload, &mut buf)
+        .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+    Ok(buf[..n].to_vec())
+}
+
+/// Opens a message produced by `seal` (ADR 023).
+///
+/// `sender_public_key` is the claimed sender's key, looked up by the caller from the
+/// key registry using `sender_peer_id` (carried in the envelope alongside `sealed`).
+/// Noise_K verifies the sender via static-static DH during `read_message`; a key
+/// mismatch or corrupted message fails here rather than producing wrong plaintext.
+pub(crate) fn unseal(
+    identity: &NodeIdentity,
+    sender_peer_id: &PeerId,
+    sender_public_key: &[u8; 32],
+    sealed: &[u8],
+) -> Result<Vec<u8>> {
+    let mut state = snow::Builder::new(
+        NOISE_K_PARAMS
+            .parse()
+            .expect("hardcoded noise params are valid"),
+    )
+    .local_private_key(identity.private_key_bytes())
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+    .remote_public_key(sender_public_key)
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?
+    .build_responder()
+    .map_err(|e: snow::Error| PathweaveError::Session(e.to_string()))?;
+
+    let mut buf = vec![0u8; sealed.len()];
+    let n = state
+        .read_message(sealed, &mut buf)
+        .map_err(|e: snow::Error| {
+            PathweaveError::Session(format!("unseal failed for sender {sender_peer_id}: {e}"))
+        })?;
+    Ok(buf[..n].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +453,50 @@ mod tests {
         assert!(
             matches!(result, Err(PathweaveError::Session(_))),
             "expected session error on tampered ciphertext, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn seal_unseal_roundtrips() {
+        let sender = NodeIdentity::generate();
+        let dest = NodeIdentity::generate();
+        let dest_public_key: [u8; 32] = dest.public_key().try_into().unwrap();
+        let sender_public_key: [u8; 32] = sender.public_key().try_into().unwrap();
+
+        let sealed = seal(&sender, &dest_public_key, b"hop encrypted payload").unwrap();
+        let opened = unseal(&dest, sender.peer_id(), &sender_public_key, &sealed).unwrap();
+        assert_eq!(&opened[..], b"hop encrypted payload");
+    }
+
+    #[test]
+    fn unseal_with_wrong_sender_key_fails() {
+        let sender = NodeIdentity::generate();
+        let dest = NodeIdentity::generate();
+        let wrong_sender = NodeIdentity::generate();
+        let dest_public_key: [u8; 32] = dest.public_key().try_into().unwrap();
+        let wrong_sender_key: [u8; 32] = wrong_sender.public_key().try_into().unwrap();
+
+        let sealed = seal(&sender, &dest_public_key, b"payload").unwrap();
+        let result = unseal(&dest, sender.peer_id(), &wrong_sender_key, &sealed);
+        assert!(
+            matches!(result, Err(PathweaveError::Session(_))),
+            "unseal with the wrong sender key must fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unseal_with_wrong_dest_identity_fails() {
+        let sender = NodeIdentity::generate();
+        let dest = NodeIdentity::generate();
+        let wrong_dest = NodeIdentity::generate();
+        let dest_public_key: [u8; 32] = dest.public_key().try_into().unwrap();
+        let sender_public_key: [u8; 32] = sender.public_key().try_into().unwrap();
+
+        let sealed = seal(&sender, &dest_public_key, b"payload").unwrap();
+        let result = unseal(&wrong_dest, sender.peer_id(), &sender_public_key, &sealed);
+        assert!(
+            matches!(result, Err(PathweaveError::Session(_))),
+            "unseal from the wrong destination identity must fail, got: {result:?}"
         );
     }
 }

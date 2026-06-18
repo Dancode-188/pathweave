@@ -38,6 +38,8 @@ pub enum PathweaveError {
     Bundle(String),
     #[error("invalid key material")]
     InvalidKey,
+    #[error("no known key for destination {0}")]
+    KeyUnknown(PeerId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -46,6 +48,7 @@ pub enum PathweaveError {
 
 pub(crate) const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub(crate) const NOISE_XK_PARAMS: &str = "Noise_XK_25519_ChaChaPoly_BLAKE2s";
+pub(crate) const NOISE_K_PARAMS: &str = "Noise_K_25519_ChaChaPoly_BLAKE2s";
 
 pub(crate) fn peer_id_from_public_key(public_key: &[u8]) -> PeerId {
     PeerId(*blake3::hash(public_key).as_bytes())
