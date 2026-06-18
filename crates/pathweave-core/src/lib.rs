@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -305,11 +305,177 @@ pub trait Connection: Send + Sync {
 
 // -- key registry --------------------------------------------------------
 
-/// Key store for the Noise_XK upgrade path; populated after every handshake. See ADR 020.
-pub(crate) type KeyRegistry = Arc<Mutex<HashMap<PeerId, [u8; 32]>>>;
+/// Maps PeerId to Curve25519 static public key for the Noise_XK upgrade path and E2E
+/// hop encryption. Populated after every handshake and, since #100, by gossip
+/// announcements. `gossip_order` is the sole record of which entries were learned via
+/// gossip rather than a direct handshake (oldest first): a peer_id's presence there,
+/// not a separate field on the entry, is what makes it eligible for eviction when the
+/// registry is bounded (#101). A direct handshake removes a peer_id from this tracking
+/// even if it was originally learned via gossip, since the handshake confirms it
+/// deserves the same protection direct entries always have. See ADR 020.
+pub struct KeyRegistryState {
+    entries: HashMap<PeerId, [u8; 32]>,
+    gossip_order: VecDeque<PeerId>,
+    max_size: Option<usize>,
+}
 
+impl KeyRegistryState {
+    fn new(max_size: Option<usize>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            gossip_order: VecDeque::new(),
+            max_size,
+        }
+    }
+
+    pub(crate) fn get(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
+        self.entries.get(peer_id).copied()
+    }
+
+    pub(crate) fn remove(&mut self, peer_id: &PeerId) -> Option<[u8; 32]> {
+        self.gossip_order.retain(|p| p != peer_id);
+        self.entries.remove(peer_id)
+    }
+
+    /// Inserts a key learned via a direct Noise handshake. Never evicted by the size
+    /// bound. Promotes the entry out of gossip-eviction tracking if it was previously
+    /// gossip-learned. Returns true if this peer_id had no entry before this call, so
+    /// callers can decide whether to fire TransportEvent::KeyLearned.
+    pub(crate) fn insert_direct(&mut self, peer_id: PeerId, public_key: [u8; 32]) -> bool {
+        self.gossip_order.retain(|p| p != &peer_id);
+        self.entries.insert(peer_id, public_key).is_none()
+    }
+
+    /// Inserts a key learned via a gossip announcement (#100). If at capacity, evicts
+    /// the oldest gossip-learned entry first; if every entry is directly handshaked,
+    /// drops the new key instead of evicting one. See #101.
+    pub(crate) fn insert_gossip(&mut self, peer_id: PeerId, public_key: [u8; 32]) {
+        if let Some(existing) = self.entries.get_mut(&peer_id) {
+            // Already known (direct handshake or earlier gossip): idempotent refresh,
+            // no capacity check needed since this does not grow the registry.
+            *existing = public_key;
+            return;
+        }
+
+        if let Some(max) = self.max_size {
+            if self.entries.len() >= max {
+                match self.gossip_order.pop_front() {
+                    Some(oldest) => {
+                        self.entries.remove(&oldest);
+                    }
+                    None => return, // every slot is directly handshaked; drop the new key
+                }
+            }
+        }
+
+        self.entries.insert(peer_id.clone(), public_key);
+        self.gossip_order.push_back(peer_id);
+    }
+}
+
+pub(crate) type KeyRegistry = Arc<Mutex<KeyRegistryState>>;
+
+#[cfg(test)]
 pub(crate) fn new_key_registry() -> KeyRegistry {
-    Arc::new(Mutex::new(HashMap::new()))
+    new_key_registry_with_bound(None)
+}
+
+pub(crate) fn new_key_registry_with_bound(max_size: Option<usize>) -> KeyRegistry {
+    Arc::new(Mutex::new(KeyRegistryState::new(max_size)))
+}
+
+#[cfg(test)]
+mod key_registry_tests {
+    use super::KeyRegistryState;
+    use crate::{NodeIdentity, PeerId};
+
+    fn dummy_key(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn dummy_peer_id() -> PeerId {
+        NodeIdentity::generate().peer_id().clone()
+    }
+
+    #[test]
+    fn gossip_entries_evict_oldest_first_without_bound_overflow() {
+        let mut registry = KeyRegistryState::new(Some(2));
+        let p1 = dummy_peer_id();
+        let p2 = dummy_peer_id();
+        let p3 = dummy_peer_id();
+
+        registry.insert_gossip(p1.clone(), dummy_key(1));
+        registry.insert_gossip(p2.clone(), dummy_key(2));
+        // At capacity (2). p1 is the oldest gossip entry and must be evicted to make
+        // room for p3.
+        registry.insert_gossip(p3.clone(), dummy_key(3));
+
+        assert_eq!(
+            registry.get(&p1),
+            None,
+            "oldest gossip entry must be evicted"
+        );
+        assert_eq!(registry.get(&p2), Some(dummy_key(2)));
+        assert_eq!(registry.get(&p3), Some(dummy_key(3)));
+    }
+
+    #[test]
+    fn direct_handshake_entry_is_never_evicted_by_gossip() {
+        let mut registry = KeyRegistryState::new(Some(1));
+        let direct_peer = dummy_peer_id();
+        let gossip_peer = dummy_peer_id();
+
+        registry.insert_direct(direct_peer.clone(), dummy_key(1));
+        // At capacity (1), and the only entry is direct, not gossip-learned: the new
+        // gossip key must be dropped, not evict the direct entry.
+        registry.insert_gossip(gossip_peer.clone(), dummy_key(2));
+
+        assert_eq!(registry.get(&direct_peer), Some(dummy_key(1)));
+        assert_eq!(
+            registry.get(&gossip_peer),
+            None,
+            "gossip-learned key must be dropped when only directly-handshaked entries exist to evict"
+        );
+    }
+
+    #[test]
+    fn direct_handshake_promotes_a_previously_gossip_learned_entry() {
+        let mut registry = KeyRegistryState::new(Some(1));
+        let peer = dummy_peer_id();
+        let other = dummy_peer_id();
+
+        registry.insert_gossip(peer.clone(), dummy_key(1));
+        // A real handshake with the same peer now confirms the key directly; it must
+        // no longer be eligible for gossip eviction.
+        registry.insert_direct(peer.clone(), dummy_key(1));
+
+        // At capacity (1) with the only entry now direct: a new gossip key must be
+        // dropped rather than evicting the promoted entry.
+        registry.insert_gossip(other.clone(), dummy_key(2));
+
+        assert_eq!(registry.get(&peer), Some(dummy_key(1)));
+        assert_eq!(registry.get(&other), None);
+    }
+
+    #[test]
+    fn unbounded_registry_never_evicts() {
+        let mut registry = KeyRegistryState::new(None);
+        let peers: Vec<PeerId> = (0..50u8)
+            .map(|i| {
+                let peer_id = dummy_peer_id();
+                registry.insert_gossip(peer_id.clone(), dummy_key(i));
+                peer_id
+            })
+            .collect();
+
+        for (i, peer_id) in peers.iter().enumerate() {
+            assert_eq!(
+                registry.get(peer_id),
+                Some(dummy_key(i as u8)),
+                "no entry should be evicted when max_size is None"
+            );
+        }
+    }
 }
 
 // -- peer table ----------------------------------------------------------
@@ -333,4 +499,9 @@ pub struct NodeConfig {
     /// When a destination's queue is full, the incoming payload is dropped and
     /// `TransportEvent::StoreFailed` is fired immediately. `None` means no bound.
     pub max_queue_depth: Option<usize>,
+    /// Maximum number of entries in the key registry. When at capacity, the oldest
+    /// gossip-learned entry (#100) is evicted first; if every entry was learned via a
+    /// direct handshake, a new gossip-learned key is dropped instead of evicting one.
+    /// `None` means no bound. See #101.
+    pub max_key_registry_size: Option<usize>,
 }
