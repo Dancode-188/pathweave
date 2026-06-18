@@ -39,10 +39,15 @@ second time, preventing duplicate delivery from the at-least-once retry mechanis
 
 Being clear about this matters.
 
-**No initiator identity hiding.** We use Noise_XX, where both sides reveal their static
-keys during the handshake. A passive observer who can intercept the handshake learns
-both parties' public keys. Noise_XK, which hides the initiator's identity from passive
-observers, is a future milestone.
+**No protection against an anonymous active prober.** We use Noise_XX. Both static keys
+are encrypted in transit, so a purely passive eavesdropper learns neither. But the
+responder's static key is encrypted only with a key derived from the
+ephemeral-ephemeral DH, which protects it from passive eavesdropping but not from
+anyone who actively connects and runs the handshake: a complete stranger with no prior
+relationship can decrypt and learn the responder's identity simply by being the one who
+initiates. Noise_XK, where the responder's static key is a pre-message never
+transmitted on the wire at all, closes this gap for known contacts and is a future
+milestone.
 
 **No group key exchange.** Noise_XX handles 1:1 sessions. There is no MLS or any other
 group key mechanism in v0.2.0.

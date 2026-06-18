@@ -23,10 +23,18 @@ Use `Noise_XX_25519_ChaChaPoly_BLAKE2s` for all sessions in v0.1.0.
 
 ## Consequences
 
-Both parties' static public keys are visible to a passive observer who can intercept
-the handshake. This is a known limitation of Noise_XX and is documented in SECURITY.md
-under "What v0.1.0 does not provide."
+Both parties' static public keys are encrypted in transit, not sent in the clear, so a
+purely passive eavesdropper learns neither. The actual exposure is narrower and
+different: the responder's static key (Noise_XX message 2) is encrypted only with a
+key derived from the ephemeral-ephemeral DH, which protects it from passive
+eavesdropping but not from an active, anonymous initiator. Anyone who can connect and
+run the handshake, even a complete stranger with no prior relationship, can decrypt and
+learn the responder's identity simply by being the one who initiates (Noise spec
+identity-hiding property 1). This is a known limitation of Noise_XX and is documented
+in SECURITY.md under "What v0.1.0 does not provide."
 
-Noise_XK, which hides the initiator's identity, becomes the v0.3.0 upgrade once we have
-a contact and key registry. The pattern string changes; the snow crate and everything
-else stays the same.
+Noise_XK, which prevents even an anonymous active initiator from learning the
+responder's identity (the responder's static key is a pre-message, never transmitted on
+the wire at all, so there is nothing to intercept or decrypt), becomes the v0.3.0
+upgrade once we have a contact and key registry. The pattern string changes; the snow
+crate and everything else stays the same.
