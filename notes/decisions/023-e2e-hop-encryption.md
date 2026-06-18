@@ -142,8 +142,14 @@ decrypt successfully every time, since decryption only depends on the fixed send
 destination static keys plus the ephemeral key embedded in the captured message itself.
 This does not need new protection in Pathweave: every routed frame, `0x01`, `0x02`, or
 `0x03`, already carries a `message_id` deduplicated at every hop (ADR 019,
-`check_and_insert_routed`), before any attempt to interpret the payload. A replayed
-`0x03` frame is dropped at the dedup check, never reaching `unseal`.
+`check_and_insert_routed`), before any attempt to interpret the payload. A `0x03` frame
+replayed within the same 60-second dedup TTL used everywhere else in this codebase
+(ADR 011, SECURITY.md's Replay suppression section) is dropped at the dedup check,
+never reaching `unseal`. A frame replayed after that window expires is no longer
+recognized as a duplicate and will successfully unseal and deliver again, the same
+time-bounded property `0x01` and `0x02` already have. This is not a new gap introduced
+here; closing it for good would mean adding a freshness mechanism Noise_K does not
+provide on its own, which is out of scope for this ADR.
 
 ### Missing key: fail loudly, never silently downgrade
 

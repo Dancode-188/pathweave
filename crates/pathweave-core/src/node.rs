@@ -422,6 +422,73 @@ impl PathweaveNode {
         }
     }
 
+    /// Sends `payload` to `dest_peer_id` via mesh routing, sealed end-to-end with
+    /// Noise_K so only `dest_peer_id` can read it (ADR 023).
+    ///
+    /// Relays along the path see `dest_peer_id` and `ttl` (needed to route) but never
+    /// the plaintext. Requires `dest_peer_id`'s static key already in the key registry
+    /// (from a direct handshake or gossip); returns `PathweaveError::KeyUnknown` if it
+    /// is not there yet rather than silently falling back to an unsealed send.
+    pub async fn send_routed_sealed(&self, dest_peer_id: PeerId, payload: Vec<u8>) -> Result<()> {
+        let dest_public_key = self
+            .key_registry
+            .lock()
+            .unwrap()
+            .get(&dest_peer_id)
+            .ok_or_else(|| PathweaveError::KeyUnknown(dest_peer_id.clone()))?;
+
+        let sealed = crate::session::seal(&self.identity, &dest_public_key, &payload)?;
+        let mut envelope = Vec::with_capacity(32 + sealed.len());
+        envelope.extend_from_slice(self.identity.peer_id().as_bytes());
+        envelope.extend_from_slice(&sealed);
+
+        let msg_id = router::new_message_id();
+        let mut frame_body = Vec::with_capacity(1 + 32 + 1 + envelope.len());
+        frame_body.push(0x03); // E2E-sealed routed route_flag (ADR 023)
+        frame_body.extend_from_slice(dest_peer_id.as_bytes());
+        frame_body.push(MAX_TTL);
+        frame_body.extend_from_slice(&envelope);
+
+        let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pid, _)| **pid != *self.identity.peer_id())
+            .map(|(pid, anns)| (pid.clone(), anns.clone()))
+            .collect();
+
+        if neighbors.is_empty() {
+            return Err(PathweaveError::NoTransportAvailable);
+        }
+
+        let mut any_ok = false;
+        for (peer_id, announcements) in neighbors {
+            if self
+                .router
+                .send(
+                    &announcements,
+                    &self.identity,
+                    frame_body.clone(),
+                    &peer_id,
+                    &self.key_registry,
+                    &self.peers,
+                    Some(msg_id),
+                )
+                .await
+                .is_ok()
+            {
+                any_ok = true;
+            }
+        }
+
+        if any_ok {
+            Ok(())
+        } else {
+            Err(PathweaveError::DeliveryFailed)
+        }
+    }
+
     /// Accepts `payload` for deferred delivery to `peer_id` and returns immediately.
     ///
     /// If the peer is already reachable, delivery is attempted right away using the same
@@ -1032,6 +1099,81 @@ async fn dispatch_payload(
                 tracing::debug!(peer = %sender_peer_id, "key announcement: parse failed; skipping");
             }
         },
+        0x03 => {
+            // [dest_peer_id: 32][ttl: 1][envelope: sender_peer_id(32) + noise_k_message] (ADR 023)
+            if payload.len() < 9 + 32 + 1 + 32 {
+                tracing::debug!(peer = %sender_peer_id, "sealed routed frame too short; skipping");
+                let _ = session.send(b"").await;
+                return;
+            }
+            let dest_bytes: [u8; 32] = payload[9..41].try_into().unwrap();
+            let dest = PeerId::from_bytes(dest_bytes);
+            let ttl = payload[41].min(MAX_TTL);
+            let envelope = &payload[42..];
+            let sealed_sender_bytes: [u8; 32] = envelope[..32].try_into().unwrap();
+            let sealed_sender = PeerId::from_bytes(sealed_sender_bytes);
+            let noise_k_message = &envelope[32..];
+
+            if &dest == local_peer_id {
+                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                if is_dup {
+                    tracing::debug!(
+                        msg_id,
+                        "suppressed duplicate sealed routed message at destination"
+                    );
+                } else {
+                    let sender_key = key_registry.lock().unwrap().get(&sealed_sender);
+                    match sender_key {
+                        Some(sender_key) => match crate::session::unseal(
+                            identity,
+                            &sealed_sender,
+                            &sender_key,
+                            noise_k_message,
+                        ) {
+                            Ok(plaintext) => {
+                                if let Some(h) = handler.lock().unwrap().as_ref() {
+                                    h.on_message(sealed_sender, plaintext);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(peer = %sealed_sender, error = %e, "unseal failed; dropping");
+                            }
+                        },
+                        None => {
+                            tracing::debug!(peer = %sealed_sender, "sealed routed message: sender key unknown; dropping");
+                        }
+                    }
+                }
+            } else if ttl == 0 {
+                tracing::debug!(msg_id, "TTL=0: silently dropping sealed routed message");
+            } else {
+                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                if !is_dup {
+                    let new_ttl = ttl - 1;
+                    let mut relay_body = Vec::with_capacity(1 + 32 + 1 + envelope.len());
+                    relay_body.push(0x03);
+                    relay_body.extend_from_slice(dest.as_bytes());
+                    relay_body.push(new_ttl);
+                    relay_body.extend_from_slice(envelope);
+
+                    spawn_relay_to_neighbors(
+                        relay_body,
+                        msg_id,
+                        sender_peer_id,
+                        local_peer_id,
+                        peers,
+                        router,
+                        identity,
+                        key_registry,
+                    );
+                } else {
+                    tracing::debug!(
+                        msg_id,
+                        "suppressed duplicate sealed routed message at relay"
+                    );
+                }
+            }
+        }
         _ => {
             tracing::debug!(peer = %sender_peer_id, route_flag, "unknown route_flag; skipping");
         }
@@ -1729,6 +1871,26 @@ mod tests {
         }
     }
 
+    type IdentifiedSender = tokio::sync::oneshot::Sender<(PeerId, Vec<u8>)>;
+
+    // Captures both the reported sender PeerId and the payload, unlike
+    // CountingHandler which discards the sender. Used to assert E2E-sealed
+    // delivery reports the cryptographically authenticated sender (ADR 023),
+    // not just the immediate transport-level relay.
+    struct IdentifyingHandler {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        tx: Arc<Mutex<Option<IdentifiedSender>>>,
+    }
+
+    impl MessageHandler for IdentifyingHandler {
+        fn on_message(&self, peer_id: PeerId, payload: Vec<u8>) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            if let Some(tx) = self.tx.lock().unwrap().take() {
+                let _ = tx.send((peer_id, payload));
+            }
+        }
+    }
+
     // --- mesh routing integration tests --------------------------------------
 
     // Topology: A --[Ble]--> B --[Quic]--> C
@@ -2180,6 +2342,216 @@ mod tests {
             count_c.load(Ordering::Relaxed),
             1,
             "invariant 4: routed message delivered exactly once despite two distinct sender paths"
+        );
+    }
+
+    // --- E2E hop encryption tests (ADR 023) -----------------------------------
+
+    // Topology: A --[Ble]--> B --[Quic]--> C, same as routed_message_delivered_via_relay,
+    // but A seals the payload to C's key. B relays the opaque envelope without ever
+    // calling on_message; only C, holding the matching private key, can open it.
+    #[tokio::test]
+    async fn sealed_routed_message_relay_cannot_read_payload() {
+        let id_a = NodeIdentity::generate();
+        let id_b = NodeIdentity::generate();
+        let id_c = NodeIdentity::generate();
+
+        let pid_a = id_a.peer_id().clone();
+        let pid_b = id_b.peer_id().clone();
+        let pid_c = id_c.peer_id().clone();
+        let key_a: [u8; 32] = id_a.public_key().try_into().unwrap();
+        let key_c: [u8; 32] = id_c.public_key().try_into().unwrap();
+
+        let (t_a, t_b_inbound) = wire_transports(TransportKind::Ble);
+        let (t_b_outbound, t_c) = wire_transports(TransportKind::Quic);
+
+        let mut node_a = PathweaveNode::new(NodeConfig::default(), id_a)
+            .await
+            .unwrap();
+        node_a.register_transport(Box::new(t_a));
+        node_a.add_peer(pid_b.clone(), ble_ann("node-b"));
+        // A must already have C's key to seal to it (from a prior handshake or gossip;
+        // ADR 023 never falls back to sending unsealed).
+        node_a
+            .key_registry
+            .lock()
+            .unwrap()
+            .insert_direct(pid_c.clone(), key_c);
+
+        let mut node_b = PathweaveNode::new(NodeConfig::default(), id_b)
+            .await
+            .unwrap();
+        node_b.register_transport(Box::new(t_b_inbound));
+        node_b.register_transport(Box::new(t_b_outbound));
+        node_b.add_peer(pid_a.clone(), ble_ann("node-a"));
+        node_b.add_peer(
+            pid_c.clone(),
+            PeerAnnouncement {
+                address: PeerAddress::Quic("127.0.0.1:30".parse().unwrap()),
+                short_id: None,
+            },
+        );
+
+        let mut node_c = PathweaveNode::new(NodeConfig::default(), id_c)
+            .await
+            .unwrap();
+        node_c.register_transport(Box::new(t_c));
+        node_c.add_peer(
+            pid_b.clone(),
+            PeerAnnouncement {
+                address: PeerAddress::Quic("127.0.0.1:31".parse().unwrap()),
+                short_id: None,
+            },
+        );
+        // C must already have A's key to verify and open the seal.
+        node_c
+            .key_registry
+            .lock()
+            .unwrap()
+            .insert_direct(pid_a.clone(), key_a);
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let count_c = Arc::new(AtomicUsize::new(0));
+        let (c_tx, c_rx) = tokio::sync::oneshot::channel::<(PeerId, Vec<u8>)>();
+        let c_tx = Arc::new(Mutex::new(Some(c_tx)));
+
+        node_a.on_message(Box::new(CountingHandler {
+            count: Arc::clone(&count_a),
+            payload_tx: Arc::new(Mutex::new(None)),
+        }));
+        node_b.on_message(Box::new(CountingHandler {
+            count: Arc::clone(&count_b),
+            payload_tx: Arc::new(Mutex::new(None)),
+        }));
+        node_c.on_message(Box::new(IdentifyingHandler {
+            count: Arc::clone(&count_c),
+            tx: c_tx,
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        node_a
+            .send_routed_sealed(pid_c.clone(), b"e2e sealed payload".to_vec())
+            .await
+            .unwrap();
+
+        let (reported_sender, delivered) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), c_rx)
+                .await
+                .expect("timed out waiting for sealed delivery")
+                .unwrap();
+
+        assert_eq!(delivered, b"e2e sealed payload");
+        assert_eq!(
+            reported_sender, pid_a,
+            "destination must see the cryptographically authenticated sender, not the relay"
+        );
+        assert_eq!(
+            count_c.load(Ordering::Relaxed),
+            1,
+            "delivered exactly once at C"
+        );
+        assert_eq!(
+            count_b.load(Ordering::Relaxed),
+            0,
+            "relay never decrypts or delivers a sealed message"
+        );
+        assert_eq!(count_a.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn send_routed_sealed_returns_key_unknown_without_destination_key() {
+        let id_a = NodeIdentity::generate();
+        let node_a = PathweaveNode::new(NodeConfig::default(), id_a)
+            .await
+            .unwrap();
+
+        let unknown_dest = NodeIdentity::generate().peer_id().clone();
+        let result = node_a
+            .send_routed_sealed(unknown_dest.clone(), b"payload".to_vec())
+            .await;
+
+        match result {
+            Err(PathweaveError::KeyUnknown(p)) => assert_eq!(p, unknown_dest),
+            other => panic!("expected KeyUnknown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_sealed_message_is_dropped_at_dedup() {
+        // Build one route_flag 0x03 frame by hand with a fixed message_id and send it
+        // twice over the same path. dispatch_payload's 0x03 branch checks
+        // check_and_insert_routed before calling unseal (ADR 023), so the second
+        // delivery must be suppressed without needing to involve unseal at all.
+        let id_s = NodeIdentity::generate();
+        let id_c = NodeIdentity::generate();
+        let pid_c = id_c.peer_id().clone();
+        let key_c: [u8; 32] = id_c.public_key().try_into().unwrap();
+
+        let (t_s, t_c) = wire_transports(TransportKind::Ble);
+
+        let mut node_s = PathweaveNode::new(NodeConfig::default(), id_s.clone())
+            .await
+            .unwrap();
+        node_s.register_transport(Box::new(t_s));
+
+        let mut node_c = PathweaveNode::new(NodeConfig::default(), id_c)
+            .await
+            .unwrap();
+        node_c.register_transport(Box::new(t_c));
+
+        let count_c = Arc::new(AtomicUsize::new(0));
+        let (c_tx, c_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let c_tx_arc = Arc::new(Mutex::new(Some(c_tx)));
+        node_c.on_message(Box::new(CountingHandler {
+            count: Arc::clone(&count_c),
+            payload_tx: Arc::clone(&c_tx_arc),
+        }));
+
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+
+        let sealed = crate::session::seal(&id_s, &key_c, b"replay me").unwrap();
+        let mut envelope = Vec::with_capacity(32 + sealed.len());
+        envelope.extend_from_slice(id_s.peer_id().as_bytes());
+        envelope.extend_from_slice(&sealed);
+
+        let msg_id = crate::router::new_message_id();
+        let mut frame_body = Vec::new();
+        frame_body.push(0x03);
+        frame_body.extend_from_slice(pid_c.as_bytes());
+        frame_body.push(MAX_TTL);
+        frame_body.extend_from_slice(&envelope);
+
+        for _ in 0..2 {
+            node_s
+                .router
+                .send(
+                    &[ble_ann("c")],
+                    &id_s,
+                    frame_body.clone(),
+                    &pid_c,
+                    &node_s.key_registry,
+                    &node_s.peers,
+                    Some(msg_id),
+                )
+                .await
+                .unwrap();
+        }
+
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), c_rx)
+            .await
+            .expect("timed out waiting for sealed delivery");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            count_c.load(Ordering::Relaxed),
+            1,
+            "replayed sealed frame must not be delivered twice"
         );
     }
 
