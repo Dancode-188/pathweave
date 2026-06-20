@@ -201,13 +201,20 @@ async fn dispatch_loop(
             continue;
         }
 
-        let existing_tx = connections.lock().unwrap().get(&source).cloned();
+        let existing_tx = connections
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&source)
+            .cloned();
         if let Some(tx) = existing_tx {
             let _ = tx.send(Bytes::copy_from_slice(payload));
         } else {
             let (tx, rx) = mpsc::unbounded_channel();
             let _ = tx.send(Bytes::copy_from_slice(payload));
-            connections.lock().unwrap().insert(source, tx);
+            connections
+                .lock()
+                .expect("mutex not poisoned")
+                .insert(source, tx);
             let conn: Box<dyn Connection> = Box::new(BroadcastConnection {
                 bearer: Arc::clone(&bearer),
                 local_short_id,
@@ -276,7 +283,7 @@ impl Transport for BleAdvertisingTransport {
         let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8]
             .try_into()
             .expect("PeerId is always 32 bytes");
-        *self.local_short_id.lock().unwrap() = Some(short_id);
+        *self.local_short_id.lock().expect("mutex not poisoned") = Some(short_id);
 
         let bearer = Arc::clone(&self.bearer);
         let connections = Arc::clone(&self.connections);
@@ -298,8 +305,8 @@ impl Transport for BleAdvertisingTransport {
         if let Some(handle) = self.dispatcher_handle.lock().await.take() {
             handle.abort();
         }
-        *self.local_short_id.lock().unwrap() = None;
-        self.connections.lock().unwrap().clear();
+        *self.local_short_id.lock().expect("mutex not poisoned") = None;
+        self.connections.lock().expect("mutex not poisoned").clear();
         Ok(())
     }
 
@@ -331,11 +338,14 @@ impl Transport for BleAdvertisingTransport {
         let local_short_id = self
             .local_short_id
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .ok_or_else(|| PathweaveError::Transport("transport not started".into()))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        self.connections.lock().unwrap().insert(peer_short_id, tx);
+        self.connections
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(peer_short_id, tx);
 
         Ok(Box::new(BroadcastConnection {
             bearer: Arc::clone(&self.bearer),
@@ -371,7 +381,7 @@ impl Transport for BleAdvertisingTransport {
     }
 
     fn local_addresses(&self) -> Vec<PeerAddress> {
-        match *self.local_short_id.lock().unwrap() {
+        match *self.local_short_id.lock().expect("mutex not poisoned") {
             Some(id) => vec![PeerAddress::BleAdvertising(short_id_to_hex(id))],
             None => vec![],
         }

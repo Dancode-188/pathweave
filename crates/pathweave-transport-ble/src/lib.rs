@@ -621,7 +621,9 @@ impl Transport for BleTransport {
                             if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
                                 continue;
                             }
-                            let short_id: [u8; 8] = data[1..9].try_into().unwrap();
+                            let short_id: [u8; 8] = data[1..9]
+                                .try_into()
+                                .expect("length checked above: data[1..9] is exactly 8 bytes");
                             let announcement = PeerAnnouncement {
                                 address: PeerAddress::Ble(id.to_string()),
                                 short_id: Some(short_id),
@@ -647,7 +649,9 @@ impl Transport for BleTransport {
                         if data.len() < 9 || data[0] != ADVERTISEMENT_VERSION {
                             continue;
                         }
-                        let short_id: [u8; 8] = data[1..9].try_into().unwrap();
+                        let short_id: [u8; 8] = data[1..9]
+                            .try_into()
+                            .expect("length checked above: data[1..9] is exactly 8 bytes");
                         let announcement = PeerAnnouncement {
                             address: PeerAddress::Ble(id.to_string()),
                             short_id: Some(short_id),
@@ -833,7 +837,9 @@ impl BleTransport {
         };
         use std::collections::BTreeMap;
 
-        let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8].try_into().unwrap();
+        let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8]
+            .try_into()
+            .expect("PeerId is always 32 bytes");
 
         let session = bluer::Session::new()
             .await
@@ -933,7 +939,9 @@ impl BleTransport {
         use windows::Foundation::TypedEventHandler;
         use windows::Storage::Streams::DataReader;
 
-        let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8].try_into().unwrap();
+        let short_id: [u8; 8] = identity.peer_id().as_bytes()[..8]
+            .try_into()
+            .expect("PeerId is always 32 bytes");
 
         let write_forward: Arc<
             std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>,

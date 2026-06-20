@@ -73,11 +73,14 @@ impl Router {
             Arc::clone(&self.transports),
         ));
 
-        self.transports.lock().unwrap().push(TransportEntry {
-            transport,
-            available,
-            task,
-        });
+        self.transports
+            .lock()
+            .expect("mutex not poisoned")
+            .push(TransportEntry {
+                transport,
+                available,
+                task,
+            });
 
         started_rx
     }
@@ -109,7 +112,7 @@ impl Router {
         let any_available = self
             .transports
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .any(|t| t.available.load(Ordering::Acquire));
         if !any_available {
@@ -120,7 +123,7 @@ impl Router {
 
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let mut candidates: Vec<(Arc<dyn Transport>, PeerAnnouncement)> = {
-                let guard = self.transports.lock().unwrap();
+                let guard = self.transports.lock().expect("mutex not poisoned");
                 guard
                     .iter()
                     .filter(|t| t.available.load(Ordering::Acquire))
@@ -210,7 +213,7 @@ impl Router {
         peer_table: &PeerTable,
     ) -> Result<PeerId> {
         let mut candidates: Vec<(Arc<dyn Transport>, PeerAnnouncement)> = {
-            let guard = self.transports.lock().unwrap();
+            let guard = self.transports.lock().expect("mutex not poisoned");
             guard
                 .iter()
                 .filter(|t| t.available.load(Ordering::Acquire))
@@ -258,7 +261,7 @@ impl Router {
     pub fn local_addresses(&self) -> Vec<PeerAddress> {
         self.transports
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .flat_map(|e| e.transport.local_addresses())
             .collect()
@@ -287,7 +290,7 @@ impl Default for Router {
 
 impl Drop for Router {
     fn drop(&mut self) {
-        for entry in self.transports.lock().unwrap().iter() {
+        for entry in self.transports.lock().expect("mutex not poisoned").iter() {
             entry.task.abort();
         }
     }
@@ -392,7 +395,7 @@ fn next_best_transport(
 ) -> Option<TransportKind> {
     transports
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .iter()
         .filter(|e| {
             !Arc::ptr_eq(&e.available, own_available) && e.available.load(Ordering::Acquire)
@@ -436,7 +439,7 @@ async fn try_connect(
     let peer_id = session.peer_id().clone();
     let is_new_key = key_registry
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .insert_direct(peer_id.clone(), *session.remote_static_key());
     let learned_key = is_new_key.then(|| *session.remote_static_key());
     let local = transport.local_addresses();
@@ -615,7 +618,7 @@ pub(crate) fn decode_addr_exchange(bytes: &[u8]) -> Option<Vec<PeerAddress>> {
 
 /// Upserts `addrs` into the peer table entry for `peer_id`, deduplicating by address.
 pub(crate) fn upsert_peer_addresses(peers: &PeerTable, peer_id: &PeerId, addrs: Vec<PeerAddress>) {
-    let mut guard = peers.lock().unwrap();
+    let mut guard = peers.lock().expect("mutex not poisoned");
     let entry = guard.entry(peer_id.clone()).or_default();
     for addr in addrs {
         let ann = PeerAnnouncement {
@@ -681,7 +684,7 @@ pub(crate) async fn flood_key_announcement(
 
     let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .iter()
         .filter(|(pid, _)| *pid != learned_peer_id && *pid != local_peer_id)
         .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -731,7 +734,10 @@ async fn try_send(
     peer_id: &PeerId,
     peers: &PeerTable,
 ) -> Result<Option<[u8; 32]>> {
-    let remote_key = key_registry.lock().unwrap().get(peer_id);
+    let remote_key = key_registry
+        .lock()
+        .expect("mutex not poisoned")
+        .get(peer_id);
     let raw = transport.connect(peer).await.map_err(|e| {
         tracing::debug!(addr = ?peer.address, error = %e, "try_send: connect failed");
         e
@@ -742,7 +748,10 @@ async fn try_send(
         Err(e) => {
             if remote_key.is_some() {
                 // XK failed; evict the stale key so the next retry uses XX.
-                key_registry.lock().unwrap().remove(peer_id);
+                key_registry
+                    .lock()
+                    .expect("mutex not poisoned")
+                    .remove(peer_id);
             }
             tracing::debug!(addr = ?peer.address, error = %e, "try_send: handshake failed");
             return Err(e);
@@ -750,7 +759,7 @@ async fn try_send(
     };
     let is_new_key = key_registry
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .insert_direct(session.peer_id().clone(), *session.remote_static_key());
     let learned_key = is_new_key.then(|| *session.remote_static_key());
 
@@ -827,7 +836,11 @@ pub(crate) async fn peer_stream(
                     let addr = announcement.address.clone();
 
                     // Skip re-announcements from already-connected addresses (O(1) check).
-                    if !known_addrs.lock().unwrap().insert(addr.clone()) {
+                    if !known_addrs
+                        .lock()
+                        .expect("mutex not poisoned")
+                        .insert(addr.clone())
+                    {
                         continue;
                     }
 
@@ -848,7 +861,7 @@ pub(crate) async fn peer_stream(
                             tracing::debug!(addr = %addr, peer = %peer_id, "peer connected");
                             peers
                                 .lock()
-                                .unwrap()
+                                .expect("mutex not poisoned")
                                 .entry(peer_id.clone())
                                 .or_default()
                                 .push(announcement);
@@ -863,20 +876,31 @@ pub(crate) async fn peer_stream(
                         Err(e) => {
                             tracing::debug!(addr = %addr, "handshake failed: {}", e);
                             // Remove so we retry on the next re-announcement.
-                            known_addrs.lock().unwrap().remove(&addr);
+                            known_addrs
+                                .lock()
+                                .expect("mutex not poisoned")
+                                .remove(&addr);
                         }
                     }
                 }
                 PeerEvent::Departure(addr) => {
-                    let peer_id = peers.lock().unwrap().iter().find_map(|(pid, anns)| {
-                        if anns.iter().any(|a| a.address == addr) {
-                            Some(pid.clone())
-                        } else {
-                            None
-                        }
-                    });
+                    let peer_id =
+                        peers
+                            .lock()
+                            .expect("mutex not poisoned")
+                            .iter()
+                            .find_map(|(pid, anns)| {
+                                if anns.iter().any(|a| a.address == addr) {
+                                    Some(pid.clone())
+                                } else {
+                                    None
+                                }
+                            });
                     if let Some(peer_id) = peer_id {
-                        known_addrs.lock().unwrap().remove(&addr);
+                        known_addrs
+                            .lock()
+                            .expect("mutex not poisoned")
+                            .remove(&addr);
                         tracing::debug!(addr = %addr, peer = %peer_id, "peer departed");
                         let _ = event_tx.send(TransportEvent::PeerDisconnected(peer_id));
                     }
