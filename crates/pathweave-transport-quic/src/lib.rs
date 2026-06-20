@@ -307,7 +307,7 @@ impl Transport for QuicTransport {
             Endpoint::server(server_config, self.listen_addr).map_err(PathweaveError::Io)?;
         let local_addr = endpoint.local_addr().map_err(PathweaveError::Io)?;
         *self.endpoint.lock().await = Some(endpoint);
-        *self.started_addr.lock().unwrap() = Some(local_addr);
+        *self.started_addr.lock().expect("mutex not poisoned") = Some(local_addr);
 
         let daemon = ServiceDaemon::new().map_err(|e| PathweaveError::Transport(e.to_string()))?;
 
@@ -377,7 +377,7 @@ impl Transport for QuicTransport {
             }
         });
 
-        *self.mdns.lock().unwrap() = Some(MdnsState {
+        *self.mdns.lock().expect("mutex not poisoned") = Some(MdnsState {
             daemon,
             service_fullname,
             announce_rx: Some(announce_rx),
@@ -400,11 +400,11 @@ impl Transport for QuicTransport {
     }
 
     async fn stop(&self) -> Result<()> {
-        *self.started_addr.lock().unwrap() = None;
+        *self.started_addr.lock().expect("mutex not poisoned") = None;
         if let Some(ep) = self.endpoint.lock().await.take() {
             ep.close(0u32.into(), b"shutdown");
         }
-        if let Some(state) = self.mdns.lock().unwrap().take() {
+        if let Some(state) = self.mdns.lock().expect("mutex not poisoned").take() {
             let _ = state.daemon.unregister(&state.service_fullname);
             let _ = state.daemon.stop_browse(SERVICE_TYPE);
             state.bridge.abort();
@@ -417,7 +417,7 @@ impl Transport for QuicTransport {
         let rx = self
             .mdns
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .as_mut()
             .and_then(|state| state.announce_rx.take());
 
@@ -436,8 +436,12 @@ impl Transport for QuicTransport {
         };
 
         let client_config = make_client_config()?;
-        let mut endpoint =
-            Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(PathweaveError::Io)?;
+        let mut endpoint = Endpoint::client(
+            "0.0.0.0:0"
+                .parse()
+                .expect("hardcoded address is always valid"),
+        )
+        .map_err(PathweaveError::Io)?;
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint
@@ -503,7 +507,7 @@ impl Transport for QuicTransport {
     fn local_addresses(&self) -> Vec<PeerAddress> {
         self.started_addr
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .map(|addr| vec![PeerAddress::Quic(addr)])
             .unwrap_or_default()
     }
@@ -512,7 +516,7 @@ impl Transport for QuicTransport {
         let rx = self
             .mdns
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .as_mut()
             .and_then(|state| state.departure_rx.take());
 

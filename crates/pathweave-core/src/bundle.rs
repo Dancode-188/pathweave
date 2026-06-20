@@ -205,7 +205,10 @@ impl Connection for BundleLayer {
             pending.fragments.insert(offset, chunk);
 
             if pending.is_complete() {
-                let complete = self.pending.remove(&seq).unwrap();
+                let complete = self
+                    .pending
+                    .remove(&seq)
+                    .expect("entry was inserted above and is_complete() confirmed it");
                 return Ok(Bytes::from(complete.reassemble()));
             }
         }

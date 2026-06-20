@@ -248,10 +248,10 @@ impl PathweaveNode {
             .await?;
         self.known_addrs
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .insert(announcement.address.clone());
         {
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self.peers.lock().expect("mutex not poisoned");
             let addrs = peers.entry(peer_id.clone()).or_default();
             if !addrs.iter().any(|a| a.address == announcement.address) {
                 addrs.push(announcement);
@@ -291,10 +291,10 @@ impl PathweaveNode {
     pub fn add_peer(&mut self, peer_id: PeerId, announcement: PeerAnnouncement) {
         self.known_addrs
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .insert(announcement.address.clone());
         {
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self.peers.lock().expect("mutex not poisoned");
             let addrs = peers.entry(peer_id.clone()).or_default();
             if !addrs.iter().any(|a| a.address == announcement.address) {
                 addrs.push(announcement);
@@ -346,7 +346,7 @@ impl PathweaveNode {
         let announcements = self
             .peers
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .get(&peer_id)
             .cloned()
             .ok_or(PathweaveError::NoTransportAvailable)?;
@@ -385,7 +385,7 @@ impl PathweaveNode {
         let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = self
             .peers
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .filter(|(pid, _)| **pid != *self.identity.peer_id())
             .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -433,7 +433,7 @@ impl PathweaveNode {
         let dest_public_key = self
             .key_registry
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .get(&dest_peer_id)
             .ok_or_else(|| PathweaveError::KeyUnknown(dest_peer_id.clone()))?;
 
@@ -452,7 +452,7 @@ impl PathweaveNode {
         let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = self
             .peers
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .filter(|(pid, _)| **pid != *self.identity.peer_id())
             .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -502,7 +502,12 @@ impl PathweaveNode {
         let msg_id = router::new_message_id();
         let queued_at = Instant::now();
 
-        let announcements = self.peers.lock().unwrap().get(&peer_id).cloned();
+        let announcements = self
+            .peers
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&peer_id)
+            .cloned();
         if let Some(anns) = announcements {
             if !anns.is_empty() {
                 let mut framed = Vec::with_capacity(1 + payload.len());
@@ -527,7 +532,7 @@ impl PathweaveNode {
             }
         }
 
-        let mut queue = self.pending_direct.lock().unwrap();
+        let mut queue = self.pending_direct.lock().expect("mutex not poisoned");
         let deque = queue.entry(peer_id.clone()).or_default();
         if let Some(max) = self.max_queue_depth {
             if deque.len() >= max {
@@ -555,7 +560,7 @@ impl PathweaveNode {
         let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = self
             .peers
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .filter(|(pid, _)| **pid != *self.identity.peer_id())
             .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -592,7 +597,7 @@ impl PathweaveNode {
             }
         }
 
-        let mut queue = self.pending_routed.lock().unwrap();
+        let mut queue = self.pending_routed.lock().expect("mutex not poisoned");
         let deque = queue.entry(dest_peer_id.clone()).or_default();
         if let Some(max) = self.max_queue_depth {
             if deque.len() >= max {
@@ -611,7 +616,7 @@ impl PathweaveNode {
     /// that do not support incoming connections (e.g. BLE central mode) return an
     /// error from accept(), which the loop handles with a backoff.
     pub fn on_message(&self, handler: Box<dyn MessageHandler>) {
-        *self.handler.lock().unwrap() = Some(handler);
+        *self.handler.lock().expect("mutex not poisoned") = Some(handler);
     }
 
     /// Returns a stream of transport lifecycle events from the Router.
@@ -624,7 +629,10 @@ impl PathweaveNode {
     /// Populated after every successful handshake. Used by the Noise_XK upgrade path
     /// and future E2E hop encryption. See ADR 020.
     pub fn lookup_key(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
-        self.key_registry.lock().unwrap().get(peer_id)
+        self.key_registry
+            .lock()
+            .expect("mutex not poisoned")
+            .get(peer_id)
     }
 }
 
@@ -645,7 +653,7 @@ async fn drain_direct_for_peer(
     event_tx: &broadcast::Sender<TransportEvent>,
 ) {
     let entries: Vec<(u64, Vec<u8>, Instant)> = {
-        let mut store = pending_direct.lock().unwrap();
+        let mut store = pending_direct.lock().expect("mutex not poisoned");
         match store.remove(peer_id) {
             Some(q) => q.into_iter().collect(),
             None => return,
@@ -655,7 +663,7 @@ async fn drain_direct_for_peer(
     let now = Instant::now();
     let announcements = peers
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .get(peer_id)
         .cloned()
         .unwrap_or_default();
@@ -693,7 +701,7 @@ async fn drain_direct_for_peer(
     }
 
     if !failures.is_empty() {
-        let mut store = pending_direct.lock().unwrap();
+        let mut store = pending_direct.lock().expect("mutex not poisoned");
         let queue = store.entry(peer_id.clone()).or_default();
         for entry in failures.into_iter().rev() {
             queue.push_front(entry);
@@ -716,11 +724,16 @@ async fn drain_routed_all(
     store_ttl: Duration,
     event_tx: &broadcast::Sender<TransportEvent>,
 ) {
-    let dest_ids: Vec<PeerId> = pending_routed.lock().unwrap().keys().cloned().collect();
+    let dest_ids: Vec<PeerId> = pending_routed
+        .lock()
+        .expect("mutex not poisoned")
+        .keys()
+        .cloned()
+        .collect();
 
     for dest_peer_id in dest_ids {
         let entries: Vec<(u64, Vec<u8>, Instant)> = {
-            let mut store = pending_routed.lock().unwrap();
+            let mut store = pending_routed.lock().expect("mutex not poisoned");
             match store.remove(&dest_peer_id) {
                 Some(q) => q.into_iter().collect(),
                 None => continue,
@@ -730,7 +743,7 @@ async fn drain_routed_all(
         let now = Instant::now();
         let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
             .lock()
-            .unwrap()
+            .expect("mutex not poisoned")
             .iter()
             .filter(|(pid, _)| **pid != *identity.peer_id())
             .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -778,7 +791,7 @@ async fn drain_routed_all(
         }
 
         if !failures.is_empty() {
-            let mut store = pending_routed.lock().unwrap();
+            let mut store = pending_routed.lock().expect("mutex not poisoned");
             let queue = store.entry(dest_peer_id.clone()).or_default();
             for entry in failures.into_iter().rev() {
                 queue.push_front(entry);
@@ -861,7 +874,7 @@ async fn handle_incoming(
     let sender_peer_id = session.peer_id().clone();
     let is_new_key = key_registry
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .insert_direct(sender_peer_id.clone(), *session.remote_static_key());
     if is_new_key {
         let _ = router.event_tx().send(TransportEvent::KeyLearned {
@@ -941,7 +954,7 @@ fn spawn_relay_to_neighbors(
 ) {
     let neighbors: Vec<(PeerId, Vec<PeerAnnouncement>)> = peers
         .lock()
-        .unwrap()
+        .expect("mutex not poisoned")
         .iter()
         .filter(|(pid, _)| **pid != *sender_peer_id && **pid != *local_peer_id)
         .map(|(pid, anns)| (pid.clone(), anns.clone()))
@@ -998,10 +1011,10 @@ async fn dispatch_payload(
             let data = payload[9..].to_vec();
             let is_dup = dedup
                 .lock()
-                .unwrap()
+                .expect("mutex not poisoned")
                 .check_and_insert(sender_peer_id, msg_id);
             if !is_dup {
-                if let Some(h) = handler.lock().unwrap().as_ref() {
+                if let Some(h) = handler.lock().expect("mutex not poisoned").as_ref() {
                     h.on_message(sender_peer_id.clone(), data);
                 }
             } else {
@@ -1014,15 +1027,20 @@ async fn dispatch_payload(
                 let _ = session.send(b"").await;
                 return;
             }
-            let dest_bytes: [u8; 32] = payload[9..41].try_into().unwrap();
+            let dest_bytes: [u8; 32] = payload[9..41]
+                .try_into()
+                .expect("length checked above: payload[9..41] is exactly 32 bytes");
             let dest = PeerId::from_bytes(dest_bytes);
             let ttl = payload[41].min(MAX_TTL);
             let app_payload = payload[42..].to_vec();
 
             if &dest == local_peer_id {
-                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                let is_dup = dedup
+                    .lock()
+                    .expect("mutex not poisoned")
+                    .check_and_insert_routed(msg_id);
                 if !is_dup {
-                    if let Some(h) = handler.lock().unwrap().as_ref() {
+                    if let Some(h) = handler.lock().expect("mutex not poisoned").as_ref() {
                         h.on_message(sender_peer_id.clone(), app_payload);
                     }
                 } else {
@@ -1031,7 +1049,10 @@ async fn dispatch_payload(
             } else if ttl == 0 {
                 tracing::debug!(msg_id, "TTL=0: silently dropping routed message");
             } else {
-                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                let is_dup = dedup
+                    .lock()
+                    .expect("mutex not poisoned")
+                    .check_and_insert_routed(msg_id);
                 if !is_dup {
                     let new_ttl = ttl - 1;
                     let mut relay_body = Vec::with_capacity(1 + 32 + 1 + app_payload.len());
@@ -1063,13 +1084,16 @@ async fn dispatch_payload(
                         "key announcement failed hash validation; dropping"
                     );
                 } else {
-                    let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                    let is_dup = dedup
+                        .lock()
+                        .expect("mutex not poisoned")
+                        .check_and_insert_routed(msg_id);
                     if is_dup {
                         tracing::debug!(msg_id, "suppressed duplicate key announcement");
                     } else {
                         key_registry
                             .lock()
-                            .unwrap()
+                            .expect("mutex not poisoned")
                             .insert_gossip(announced_peer_id.clone(), public_key);
 
                         let ttl = ttl.min(MAX_TTL);
@@ -1106,23 +1130,33 @@ async fn dispatch_payload(
                 let _ = session.send(b"").await;
                 return;
             }
-            let dest_bytes: [u8; 32] = payload[9..41].try_into().unwrap();
+            let dest_bytes: [u8; 32] = payload[9..41]
+                .try_into()
+                .expect("length checked above: payload[9..41] is exactly 32 bytes");
             let dest = PeerId::from_bytes(dest_bytes);
             let ttl = payload[41].min(MAX_TTL);
             let envelope = &payload[42..];
-            let sealed_sender_bytes: [u8; 32] = envelope[..32].try_into().unwrap();
+            let sealed_sender_bytes: [u8; 32] = envelope[..32]
+                .try_into()
+                .expect("length checked above: envelope[..32] is exactly 32 bytes");
             let sealed_sender = PeerId::from_bytes(sealed_sender_bytes);
             let noise_k_message = &envelope[32..];
 
             if &dest == local_peer_id {
-                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                let is_dup = dedup
+                    .lock()
+                    .expect("mutex not poisoned")
+                    .check_and_insert_routed(msg_id);
                 if is_dup {
                     tracing::debug!(
                         msg_id,
                         "suppressed duplicate sealed routed message at destination"
                     );
                 } else {
-                    let sender_key = key_registry.lock().unwrap().get(&sealed_sender);
+                    let sender_key = key_registry
+                        .lock()
+                        .expect("mutex not poisoned")
+                        .get(&sealed_sender);
                     match sender_key {
                         Some(sender_key) => match crate::session::unseal(
                             identity,
@@ -1131,7 +1165,9 @@ async fn dispatch_payload(
                             noise_k_message,
                         ) {
                             Ok(plaintext) => {
-                                if let Some(h) = handler.lock().unwrap().as_ref() {
+                                if let Some(h) =
+                                    handler.lock().expect("mutex not poisoned").as_ref()
+                                {
                                     h.on_message(sealed_sender, plaintext);
                                 }
                             }
@@ -1147,7 +1183,10 @@ async fn dispatch_payload(
             } else if ttl == 0 {
                 tracing::debug!(msg_id, "TTL=0: silently dropping sealed routed message");
             } else {
-                let is_dup = dedup.lock().unwrap().check_and_insert_routed(msg_id);
+                let is_dup = dedup
+                    .lock()
+                    .expect("mutex not poisoned")
+                    .check_and_insert_routed(msg_id);
                 if !is_dup {
                     let new_ttl = ttl - 1;
                     let mut relay_body = Vec::with_capacity(1 + 32 + 1 + envelope.len());
